@@ -1,23 +1,5 @@
-// `RtspServer` (also in this directory) re-serves a printer's live camera
-// to slicers on the LAN. It doesn't care WHERE the H.264 / MJPEG frames come
-// from — only that they arrive as length-prefixed NAL units with usable
-// SPS/PPS for SDP advertising. That indirection is `ICameraSource`.
-//
-// Implementations included in this OSS plugin:
-//
-//   - LanCameraSource:    direct LAN-RTSPS via the proprietary BambuSource
-//                         library (the same one the slicer GUI uses). Only
-//                         active when the host injects a BambuSourceHandle.
-//   - JpegCameraSource:   A1 / P1 native port-6000 MJPEG-over-TLS protocol.
-//                         No proprietary dependency — OpenSSL only.
-//   - CloudCameraSource:  TUTK/Agora cloud relay. Stubbed in this OSS build
-//                         because the TUTK SDK is not OSS-compatible. The
-//                         class is wired so a host that ships its own
-//                         BambuSourceHandle + BambuNetworkingPluginHandle
-//                         can attach them at runtime and the cloud path
-//                         lights up; without attachments, open() fails fast.
-//   - NullCameraSource:   test-pattern source (single keyframe SPS/PPS/IDR
-//                         re-emitted at a configurable rate).
+// Frame source interface for libBambuSource.s TUTK path (TutkCameraSource),
+// shared by the Bambu_* stub and the Windows DirectShow filter.
 //
 // Frame encoding (documented once here):
 //   - H264 sources emit `VideoFrame::nal_data` as one OR MORE NAL units in
@@ -31,14 +13,14 @@
 // `StreamInfo::sps` / `pps` MUST be raw NAL bodies (no start code, no length
 // prefix) for the SDP `sprop-parameter-sets` advertising.
 
-#ifndef BAMBU_NET_CAMERA_I_CAMERA_SOURCE_HPP
-#define BAMBU_NET_CAMERA_I_CAMERA_SOURCE_HPP
+#ifndef OBN_CAMERA_I_CAMERA_SOURCE_HPP
+#define OBN_CAMERA_I_CAMERA_SOURCE_HPP
 
 #include <cstdint>
 #include <optional>
 #include <vector>
 
-namespace bambu_net {
+namespace obn {
 namespace camera {
 
 struct VideoFrame {
@@ -85,6 +67,6 @@ public:
 };
 
 }  // namespace camera
-}  // namespace bambu_net
+}  // namespace obn
 
-#endif  // BAMBU_NET_CAMERA_I_CAMERA_SOURCE_HPP
+#endif  // OBN_CAMERA_I_CAMERA_SOURCE_HPP

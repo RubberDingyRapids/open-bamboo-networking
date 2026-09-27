@@ -188,9 +188,9 @@ This is the **simple path, and it is enough for most people.** The printer is
 switched into Developer Mode, which turns MQTT command verification off, so the
 plugin can drive it over the LAN with no signing keys at all.
 
-1. On the printer screen, enable LAN-only mode and Developer mode. Bambu places these toggles in different submenus depending on the model and firmware — look for options named along the lines of "LAN Only", "LAN Only liveview", and "Developer mode". Examples:
-   - **P2S**: Nut icon -> Settings -> **LAN Only Mode**
-   - **P1S**: Nut icon -> **WLAN**
+1. On the printer screen, enable LAN-only mode and Developer mode. Bambu places these toggles in different submenus depending on the model and firmware, so look for options such as "LAN Only", "LAN Only Liveview", and "Developer mode". Examples:
+  - **P1S**: Nut icon -> **WLAN**.
+  - **P2S / X2D / H2D / H2S**: Nut icon -> Settings -> **LAN Only Mode**. In addition, you can enable **LAN Only Liveview** (in the same submenu or in the **General** menu). Without it, the printer reports LAN RTSP liveview as disabled, and the camera never connects.
 2. In Bambu Studio: Device -> Connect via LAN with access code.
 
 In this mode the printer skips MQTT verification and accepts plain LAN
@@ -466,6 +466,7 @@ Spaces around `=` are optional.
 | --- | --- | --- |
 | `force_ftps` | `0` | Force FTPS (port 990) for file transfer instead of the native TLS :6000 protocol. Thumbnails, timelapse files, and internal storage (eMMC) browsing are not available in this mode. Useful when the printer's :6000 file browser is broken (e.g. some A1 firmware versions). |
 | `disable_camera_preview` | `0` | Disable the annoying static "Printer Preview" JPEG snapshot shown in the device panel when live view is off. |
+| `prefer_rtsp` | `0` | For a cloud-bound printer (with `block_cloud = 0`), use the local RTSP(S) / :6000 camera stream instead of TUTK when the printer answers on LAN. If LAN is down and the slicer key is present, fall back to TUTK. Default matches the stock plugin (TUTK). Without the slicer key TUTK is unavailable. |
 | `force_timelapse_external` | `0` | Always save timelapse to external storage (USB/SD), ignoring the Internal/External toggle in the print dialog (Studio defaults to internal). |
 
 **MQTT push_status patches** (all off by default; enable only if your model needs it):

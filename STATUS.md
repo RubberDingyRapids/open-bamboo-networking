@@ -308,11 +308,11 @@ Wire-format reference for `project_file` field semantics and URL schemes: [resea
 
 Source: [src/abi_camera.cpp](src/abi_camera.cpp).
 
-This `bambu_networking.so` group only covers the **cloud / TUTK** camera URL accessors. The actual LAN live view never enters here — Studio's `MediaPlayCtrl` builds its own `bambu:///local/…` or `bambu:///rtsps___…` URL and hands it straight to `libBambuSource.so` (see the [`libBambuSource.so` second library](#libbambusourceso-second-library) section below for that path's status).
+This `bambu_networking.so` group only covers the camera URL accessors (cloud TUTK mint or LAN URL). The actual LAN live view never enters here — Studio's `MediaPlayCtrl` builds its own `bambu:///local/…` or `bambu:///rtsps___…` URL and hands it straight to `libBambuSource.so` (see the [`libBambuSource.so` second library](#libbambusourceso-second-library) section below for that path's status).
 
 | Function | Status | Notes |
 | --- | :--: | --- |
-| `bambu_network_get_camera_url` | ✅ | Stock returns a `bambu:///tutk?...` URL that cannot be minted without the proprietary TUTK / Agora SDK. Instead we return the printer's **LAN URL** (`bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>[&lv=rtsps]`) when the IP (SSDP / `connect_printer`) and access code (`connect_printer` / cloud `dev_access_code`) are known. This makes the file browser, device-panel snapshot and liveview work over the local network even for cloud-paired printers (Studio only requires the reply to start with `bambu:///`). The `lv=` hint makes `libBambuSource` fetch video via RTSP(S) `:322` instead of MJPEG `:6000` on X1/P1S/P2S-class printers. Falls back to an empty string (Studio's normal "connection failed" path) when no LAN route is known. |
+| `bambu_network_get_camera_url` | ✅ | Like stock, mints `bambu:///tutk?uid=…&authkey=…&passwd=…&region=…` via `POST /v1/iot-service/api/user/ttcode` on a worker thread (needs the slicer key: the endpoint requires the PoP headers), then waits up to 5 s for the cloud-pushed `liveview.prepare` reply / `tutk_server` enable. Returns the printer's **LAN URL** (`bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>[&lv=rtsps]`) when `prefer_rtsp` is set or the cloud is unusable **and** the printer answers a short TCP probe. If LAN is down and TUTK can be minted, the TUTK URL is returned instead; if neither path works the callback is a non-`bambu:///` string so Studio shows "Connection Failed" rather than the LAN IP dialog. [research §8.11](research/08.11-camera.md) |
 | `bambu_network_get_camera_url_for_golive` | 🔒 | Same as above, for the Go-Live flow. |
 | `bambu_network_get_hms_snapshot` | 🔒 | HMS photo snapshot is cloud-only and requires the same SDK. Callback is invoked with `("", -1)`. |
 
@@ -486,7 +486,8 @@ The build is intentionally minimal-dependency: only OpenSSL and zlib, **no `liba
 | --- | --- | :--: | --- |
 | MJPEG over TLS, port 6000 | A1 / A1 mini / P1 / P1P | ✅ (not tested) | TLS + 80-byte auth + 16-byte framed JPEG samples. Linux: passes JPEG bytes through to `gstbambusrc`'s `jpegdec`. Windows: same JPEG payload pushed through our DShow source filter as `MEDIASUBTYPE_MJPG`. No A-series hardware available for on-device verification. |
 | RTSPS → H.264 byte-stream, port 322 | X1 / X1C / X1E / P1S / P2S / H-series / X2D | ✅ (tested P2S/N7: Linux Orca, Windows Bambu Studio `wxMediaCtrl3`, Windows Orca DShow; macOS BambuPlayer built — hardware validation pending) | Custom in-process RTSP/RTSPS client with LAN TLS verify (see §8.4.1); raw H.264 Annex-B byte stream out. Linux: `gstbambusrc` → `h264parse + avdec_h264 / openh264dec`. Windows Studio: FFmpeg `AVVideoDecoder`. Windows Orca: DShow `MEDIASUBTYPE_H264`. macOS: `BambuPlayer` → AVCC → `AVSampleBufferDisplayLayer`. |
-| Cloud camera (TUTK / Agora p2p) | any printer over WAN | 🔒 | Proprietary SDK; out of scope. Stays on the LAN/Developer-Mode path. |
+| Cloud camera (TUTK) | cloud-bound printers | ⚠️ (tested P2S over LAN P2P, off-LAN P2P and relay, Linux) | Own IOTC client in `libBambuSource` ([`src/camera/tutk/`](src/camera/tutk/)): LAN search, off-LAN rendezvous / relay, DTLS-PSK, stock AV login with the framed transport (Reed–Solomon FEC, heartbeat / delay probes): P2S 1920×1080 @ 30 fps, legacy framing as fallback. Limitations: video only (file browser over TUTK switches to LAN `:6000`); off-LAN P2P (punched candidate) and relay verified with the printer's LAN address blocked. [research §8.11.5](research/08.11-camera.md#8115-tutk-transport) |
+| Cloud camera (Agora) | Go-Live / Agora-only printers | 🔒 | Third-party SDK; out of scope. |
 
 ### PrinterFileSystem (MediaFilePanel)
 

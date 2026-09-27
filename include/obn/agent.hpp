@@ -405,18 +405,20 @@ public:
     // the selected printer once the access code is known too.
     void note_device_lan_ip(const std::string& dev_id,
                             const std::string& ip);
-    // LAN fallback for bambu_network_get_camera_url: stock plugin mints a
-    // bambu:///tutk?... URL via the proprietary TUTK/Agora SDK, which we
-    // don't ship. When the printer's LAN IP (SSDP / connect_printer) and
-    // access code (connect_printer / cloud dev_access_code) are both known
-    // we return "bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>"
-    // instead, so Studio's PrinterFileSystem (file browser), the device
-    // image flow (mem:/N snapshot) and — with the lv=rtsps hint handled in
-    // libBambuSource — liveview all run over the local network even while
-    // the printer is cloud-paired. Returns "" when either piece is missing;
-    // Studio then shows its normal "connection failed" state.
+    // LAN route for bambu_network_get_camera_url (used instead of TUTK
+    // when prefer_rtsp is set and the printer answers a TCP probe, or when
+    // cloud credentials are unavailable). When the printer's LAN IP (SSDP /
+    // connect_printer) and access code (connect_printer / cloud
+    // dev_access_code) are both known we return
+    // "bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>" so Studio's
+    // PrinterFileSystem, the device image flow and — with the lv=rtsps
+    // hint — liveview can run over the local network. Returns "" when
+    // either piece is missing.
     std::string camera_url_for(const std::string& dev_id);
-    // Remote (cloud/off-LAN) camera URL via the iot-service ttcode endpoint.
+    // Remote cloud camera URL for bambu_network_get_camera_url when the LAN
+    // route is unavailable. Fetches TUTK credentials via /v1/iot-service/api/user/ttcode
+    // and returns "bambu:///tutk?uid=...". The cloud itself pushes
+    // liveview.prepare to the printer in response to that POST.
     std::string remote_camera_url(const std::string& dev_id);
     // Friendly name from the last SSDP packet for this printer IP, or "".
     std::string device_display_name_for_ip(const std::string& dev_ip) const;
@@ -465,11 +467,27 @@ private:
     void harvest_developer_mode(const std::string& dev_id,
                                 const std::string& json);
 
-    // Records the printer's ipcam.tutk_server status ("enable" / "disable")
-    // into tutk_server_ready_by_dev_ to prevent unnecessary liveview.prepare
-    // commands that restart a running server.
+    // Records the printer's print.ipcam.tutk_server status ("enable" /
+    // "disable") into tutk_server_ready_by_dev_ and the time of the last
+    // liveview.prepare "succeed" into liveview_prepared_at_; wakes
+    // wait_tutk_ready(). Cheap substring prefilter; full JSON parse only on
+    // candidate frames.
     void harvest_tutk_server_status(const std::string& dev_id,
                                     const std::string& json);
+
+    // Records the LAN access code from the printer's system.get_access_code
+    // reply (Studio asks for it over the cloud) via note_device_access_code.
+    void harvest_access_code(const std::string& dev_id,
+                             const std::string& json);
+
+    // Blocks until the printer reports it can take a TUTK session: either a
+    // liveview.prepare "succeed" newer than `since` (the reply to the
+    // cloud's prepare that follows a /user/ttcode mint) or tutk_server
+    // "enable". Returns false on timeout; the URL is still usable then, the
+    // first IOTC connect may just fail with -90 while the server starts.
+    bool wait_tutk_ready(const std::string& dev_id,
+                         std::chrono::steady_clock::time_point since,
+                         std::chrono::milliseconds timeout);
 
     // Whether outbound signed print fields should be treated as Developer
     // Mode (keep cleartext url/param) vs secured (drop cleartext, *_enc only).
@@ -583,7 +601,12 @@ private:
     // developer_mode_effective(), which falls back to a key-material default
     // until the first fun frame arrives. See research/10.03-mqtt-field-encryption.md.
     std::map<std::string, bool>                 dev_mode_on_by_dev_;
+    // TUTK readiness per dev_id, see harvest_tutk_server_status(). Guarded
+    // by mu_; tutk_ready_cv_ is notified on every update.
     std::map<std::string, bool>                 tutk_server_ready_by_dev_;
+    std::map<std::string, std::chrono::steady_clock::time_point>
+                                                liveview_prepared_at_;
+    std::condition_variable                     tutk_ready_cv_;
 
     // Devices seen on the current cloud session (first report flips them in).
     // disconnect_cloud drains this set to release the RSA pubkeys learned
@@ -618,31 +641,12 @@ private:
     std::set<std::string> certified_devs_;
     // Devices whose app_cert_install got result=SUCCESS (+ printer_cert)
     // this MQTT session. Set in harvest_security_report, not at publish.
+    // Cleared on LAN disconnect so Studio can re-provision. Guarded by mu_.
     std::set<std::string> app_cert_install_sent_;
     // Signalled when a dev_id is inserted into app_cert_install_sent_ (i.e. the
     // printer acknowledged security.app_cert_install). wait_for_app_cert()
     // waits on this instead of polling. Waits on mu_.
     std::condition_variable app_cert_cv_;
-
-    // task_ids for which we already re-dispatched a rescued project_file.
-    // Prevents duplicate rescues when both LAN and cloud report arrive.
-    // Guarded by mu_.
-    std::set<std::string> rescued_tasks_;
-    std::set<std::string> rescued_liveviews_;
-
-    // Intercepts a Bambu Cloud unsigned project_file rejection (err_code
-    // 84033543 / HMS 0500-0500-0001-0007) and re-publishes it signed+encrypted
-    // via send_message so the printer accepts it under Option B (Dev Mode OFF).
-    // `json` is the raw MQTT report frame from device/<dev_id>/report.
-    // No-op when: key unavailable, err_code != 84033543, already rescued.
-    void rescue_cloud_project_file(const std::string& dev_id,
-                                   const std::string& json);
-
-    // Intercepts a Bambu Cloud unsigned liveview prepare rejection (err_code
-    // 84033543 / HMS 0500-0500-0001-0007) and re-publishes it signed via
-    // send_message so the printer accepts it under Option B (Dev Mode OFF).
-    void rescue_cloud_liveview(const std::string& dev_id,
-                               const std::string& json);
     // dev_ids for which a cert-snapshot worker is currently running. Prevents
     // stacking multiple blocking SSL_connect attempts on a printer that
     // refuses the extra handshake.

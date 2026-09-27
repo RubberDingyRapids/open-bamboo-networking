@@ -33,7 +33,8 @@
 //
 // Extra query parameters (device=, net_ver=, dev_ver=, cli_id=, ...) are
 // ignored by the printer but device= is used for LAN TLS verify (SNI +
-// CN=serial). The printer only cares about the auth packet (MJPG) or
+// CN=serial) and the TUTK fallback; when Studio omits it the serial is
+// looked up by IP (fill_device_from_ip). The printer only cares about the auth packet (MJPG) or
 // the RTSP DESCRIBE/SETUP/PLAY exchange.
 //
 // Protocol summary (see OpenBambuAPI/video.md for the canonical spec):
@@ -116,6 +117,12 @@
 #include <filesystem>
 #if !defined(_WIN32)
 #  include <dlfcn.h>
+#  if defined(__linux__)
+#    include <link.h>
+#  endif
+#  if defined(__APPLE__)
+#    include <mach-o/dyld.h>
+#  endif
 #endif
 
 #include "obn/config.hpp"
@@ -128,7 +135,7 @@
 #include "source_log.hpp"
 #include "rtsp_passthrough.hpp"
 #include "tls_socket.hpp"
-#include "camera/OssTutkCameraSource.hpp"
+#include "camera/TutkCameraSource.hpp"
 #include "camera/ICameraSource.hpp"
 
 #if defined(_WIN32)
@@ -331,6 +338,9 @@ bool parse_url(const std::string& url, TunnelUrl* out)
             else if (key == "region")  { out->region = val; }
             else if (key == "device")  { out->device = val; }
             else if (key == "channel") { out->channel = val; }
+            else if (key == "cli_id")  { out->cli_id = val; }
+            else if (key == "cli_ver") { out->cli_ver = val; }
+            else if (key == "net_ver") { out->net_ver = val; }
             i = amp + 1;
         }
         if (out->host.empty()) out->host = "tutk-relay";
@@ -586,7 +596,7 @@ struct Tunnel {
     std::string                ctrl_current_reply;
 
     // ---- TUTK off-LAN / relay camera state (Scheme::Tutk) ----
-    std::unique_ptr<obn::camera::OssTutkCameraSource> tutk_source;
+    std::unique_ptr<obn::camera::TutkCameraSource> tutk_source;
     std::vector<uint8_t>       tutk_current_frame;
 };
 
@@ -689,7 +699,7 @@ int ssl_read_all(Tunnel* t, void* buf, size_t len)
 // stubs/rtsp_passthrough.cpp; here we just glue them onto the C ABI.
 // -----------------------------------------------------------------------
 
-[[maybe_unused]] int open_rtsp(Tunnel* t)
+int open_rtsp(Tunnel* t)
 {
     auto pass = std::make_unique<obn::rtsp::Passthrough>(t->logger, t->log_ctx);
 
@@ -759,14 +769,14 @@ int read_rtsp(Tunnel* t, Bambu_Sample* sample)
 
 // -----------------------------------------------------------------------
 // TUTK off-LAN / relay video source.
-// Uses obn::camera::OssTutkCameraSource to connect to ThroughTek
+// Uses obn::camera::TutkCameraSource to connect to ThroughTek
 // master/relay server and stream H.264 / MJPEG frames.
 // -----------------------------------------------------------------------
 
-[[maybe_unused]] int open_tutk(Tunnel* t)
+int open_tutk(Tunnel* t)
 {
     log_fmt(t->logger, t->log_ctx, "open_tutk: starting TUTK session url=%.160s", t->url.raw_url.c_str());
-    t->tutk_source = std::make_unique<obn::camera::OssTutkCameraSource>(t->url.raw_url);
+    t->tutk_source = std::make_unique<obn::camera::TutkCameraSource>(t->url.raw_url);
     if (!t->tutk_source->open()) {
         log_fmt(t->logger, t->log_ctx, "open_tutk: failed to open TUTK stream");
         set_last_error("TUTK stream open failed");
@@ -777,7 +787,7 @@ int read_rtsp(Tunnel* t, Bambu_Sample* sample)
     t->width = si.width;
     t->height = si.height;
     t->frame_rate = si.fps;
-    t->sub_type = (si.codec == bambu_net::camera::ICameraSource::Codec::MotionJpeg) ? MJPG : AVC1;
+    t->sub_type = (si.codec == obn::camera::ICameraSource::Codec::MotionJpeg) ? MJPG : AVC1;
     t->t0 = std::chrono::steady_clock::now();
     t->started = true;
     log_fmt(t->logger, t->log_ctx, "open_tutk: stream ready (%dx%d @ %d fps, subtype=%d)",
@@ -785,7 +795,7 @@ int read_rtsp(Tunnel* t, Bambu_Sample* sample)
     return Bambu_success;
 }
 
-[[maybe_unused]] int read_tutk(Tunnel* t, Bambu_Sample* sample)
+int read_tutk(Tunnel* t, Bambu_Sample* sample)
 {
     if (!t->tutk_source || !t->tutk_source->is_open()) return -1;
 
@@ -798,7 +808,7 @@ int read_rtsp(Tunnel* t, Bambu_Sample* sample)
         auto si = t->tutk_source->info();
         t->width = si.width;
         t->height = si.height;
-        t->sub_type = (si.codec == bambu_net::camera::ICameraSource::Codec::MotionJpeg) ? MJPG : AVC1;
+        t->sub_type = (si.codec == obn::camera::ICameraSource::Codec::MotionJpeg) ? MJPG : AVC1;
         log_fmt(t->logger, t->log_ctx, "read_tutk: first frame received (%dx%d, subtype=%d)",
                 t->width, t->height, t->sub_type);
     }
@@ -823,60 +833,151 @@ int read_rtsp(Tunnel* t, Bambu_Sample* sample)
     return Bambu_success;
 }
 
-using GetTutkUrlFn = const char* (*)(const char*);
+// The plugin's private obn_get_* exports (see src/abi_camera.cpp). Resolved from the already-loaded plugin module; never
+// loads it, so a stock plugin (no such symbols) simply disables the fallbacks.
+using GetUrlFn = const char* (*)(const char*);
 
-static std::string query_tutk_url(const std::string& dev_id)
+#if !defined(_WIN32)
+static GetUrlFn lookup_in_handle(void* handle, const char* name)
 {
-    if (dev_id.empty()) return {};
+    if (!handle) return nullptr;
+    return reinterpret_cast<GetUrlFn>(dlsym(handle, name));
+}
+
+#if defined(__linux__)
+struct PluginLookup {
+    const char* name;
+    GetUrlFn    fn;
+};
+
+static int visit_loaded_plugin(struct dl_phdr_info* info, size_t, void* data)
+{
+    auto* want = static_cast<PluginLookup*>(data);
+    if (!info->dlpi_name || !std::strstr(info->dlpi_name, "bambu_networking"))
+        return 0;
+    void* h = dlopen(info->dlpi_name, RTLD_NOLOAD | RTLD_LAZY);
+    if (!h) return 0;
+    want->fn = lookup_in_handle(h, want->name);
+    dlclose(h);
+    return want->fn ? 1 : 0;
+}
+#endif
+#endif
+
+static GetUrlFn resolve_plugin_url_fn(const char* name)
+{
 #if defined(_WIN32)
     static const char* const kModNames[] = {
         "bambu_networking.dll",
-        "bambu_networking_02.07.01.dll",
-        "bambu_networking_02.07.01.99.dll",
-        "bambu_networking_02.07.01.51.dll",
-        "bambu_networking_01.10.01.09.dll",
         "libbambu_networking.dll",
         nullptr
     };
-    GetTutkUrlFn fn = nullptr;
     for (int i = 0; kModNames[i]; ++i) {
-        HMODULE h = GetModuleHandleA(kModNames[i]);
-        if (h) {
-            fn = reinterpret_cast<GetTutkUrlFn>(GetProcAddress(h, "obn_get_tutk_camera_url"));
-            if (fn) break;
+        if (HMODULE h = GetModuleHandleA(kModNames[i])) {
+            if (auto fn = reinterpret_cast<GetUrlFn>(GetProcAddress(h, name)))
+                return fn;
+        }
+    }
+    // Studio may load the plugin under a versioned file name; look for any
+    // loaded bambu_networking*.dll next to this module.
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(&resolve_plugin_url_fn), &self) ||
+        !self)
+        return nullptr;
+    char self_path[1024];
+    if (GetModuleFileNameA(self, self_path, sizeof(self_path)) == 0) return nullptr;
+    std::error_code ec;
+    const auto dir = std::filesystem::path(self_path).parent_path();
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".dll") continue;
+        const auto file = entry.path().filename().string();
+        if (file.find("bambu_networking") == std::string::npos) continue;
+        if (HMODULE h = GetModuleHandleA(file.c_str())) {
+            if (auto fn = reinterpret_cast<GetUrlFn>(GetProcAddress(h, name)))
+                return fn;
+        }
+    }
+    return nullptr;
+#else
+    // Studio dlopens the plugin without RTLD_GLOBAL, so RTLD_DEFAULT often
+    // cannot see obn_get_* — look up the already-loaded module next.
+    if (auto fn = lookup_in_handle(RTLD_DEFAULT, name)) return fn;
+
+    static const char* const kNames[] = {
+        "libbambu_networking.so",
+        "bambu_networking.so",
+        "libbambu_networking.dylib",
+        nullptr
+    };
+    for (int i = 0; kNames[i]; ++i) {
+        if (void* h = dlopen(kNames[i], RTLD_NOLOAD | RTLD_LAZY)) {
+            auto fn = lookup_in_handle(h, name);
+            dlclose(h);
+            if (fn) return fn;
         }
     }
 
-    if (!fn) {
-        HMODULE hSelf = nullptr;
-        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               reinterpret_cast<LPCSTR>(&query_tutk_url), &hSelf) && hSelf) {
-            char selfPath[1024];
-            if (GetModuleFileNameA(hSelf, selfPath, sizeof(selfPath)) > 0) {
-                std::filesystem::path dir = std::filesystem::path(selfPath).parent_path();
-                std::error_code ec;
-                for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-                    if (!entry.is_regular_file()) continue;
-                    auto filename = entry.path().filename().string();
-                    if (filename.find("bambu_networking") != std::string::npos &&
-                        entry.path().extension() == ".dll") {
-                        HMODULE h = GetModuleHandleA(filename.c_str());
-                        if (h) {
-                            fn = reinterpret_cast<GetTutkUrlFn>(GetProcAddress(h, "obn_get_tutk_camera_url"));
-                            if (fn) break;
-                        }
-                    }
-                }
-            }
+#if defined(__linux__)
+    PluginLookup look{name, nullptr};
+    dl_iterate_phdr(visit_loaded_plugin, &look);
+    if (look.fn) return look.fn;
+#endif
+
+#if defined(__APPLE__)
+    const uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; ++i) {
+        const char* img = _dyld_get_image_name(i);
+        if (!img || !std::strstr(img, "bambu_networking")) continue;
+        if (void* h = dlopen(img, RTLD_NOLOAD | RTLD_LAZY)) {
+            auto fn = lookup_in_handle(h, name);
+            dlclose(h);
+            if (fn) return fn;
         }
     }
-#else
-    GetTutkUrlFn fn = reinterpret_cast<GetTutkUrlFn>(dlsym(RTLD_DEFAULT, "obn_get_tutk_camera_url"));
 #endif
-    if (!fn) return {};
-    const char* u = fn(dev_id.c_str());
+    return nullptr;
+#endif
+}
+
+static std::string query_plugin(const char* export_name, const std::string& arg)
+{
+    if (arg.empty()) return {};
+    GetUrlFn fn = resolve_plugin_url_fn(export_name);
+    if (!fn) {
+        log_fmt(nullptr, nullptr,
+                "query_plugin: %s is not exported by the loaded networking plugin",
+                export_name);
+        return {};
+    }
+    const char* u = fn(arg.c_str());
     return u ? std::string(u) : std::string{};
+}
+
+// Studio omits device= from upload / part-skip tunnel URLs; recover the
+// serial from the IP so TLS verification and the transport fallbacks work.
+static void fill_device_from_ip(TunnelUrl* url)
+{
+    if (!url->device.empty() || url->host.empty() || url->scheme == Scheme::Tutk) return;
+    if (auto serial = obn::lan_tls::registry_lookup_serial(url->host))
+        url->device = *serial;
+    else
+        url->device = query_plugin("obn_get_lan_serial", url->host);
+}
+
+// Replaces t->url with a freshly resolved URL, keeping the Studio-appended
+// identity fields (device / cli_id / cli_ver / net_ver) the new URL lacks.
+static bool adopt_url(Tunnel* t, const std::string& url)
+{
+    TunnelUrl new_url;
+    if (!parse_url(url, &new_url)) return false;
+    if (new_url.device.empty())  new_url.device  = t->url.device;
+    if (new_url.cli_id.empty())  new_url.cli_id  = t->url.cli_id;
+    if (new_url.cli_ver.empty()) new_url.cli_ver = t->url.cli_ver;
+    if (new_url.net_ver.empty()) new_url.net_ver = t->url.net_ver;
+    t->url = std::move(new_url);
+    return true;
 }
 
 static bool fallback_to_tutk(Tunnel* t)
@@ -888,25 +989,14 @@ static bool fallback_to_tutk(Tunnel* t)
     log_fmt(t->logger, t->log_ctx,
             "fallback_to_tutk: querying TUTK URL for dev=%s",
             dev_id.c_str());
-    std::string tutk_url = query_tutk_url(dev_id);
+    std::string tutk_url = query_plugin("obn_get_tutk_camera_url", dev_id);
     if (tutk_url.empty()) {
         log_fmt(t->logger, t->log_ctx,
                 "fallback_to_tutk: failed to resolve TUTK URL for dev=%s",
                 dev_id.c_str());
+        set_last_error("LAN camera is unreachable and TUTK fallback failed");
         return false;
     }
-
-    log_fmt(t->logger, t->log_ctx,
-            "fallback_to_tutk: resolved TUTK URL: %.120s",
-            tutk_url.c_str());
-    TunnelUrl new_url;
-    if (!parse_url(tutk_url, &new_url)) {
-        log_fmt(t->logger, t->log_ctx,
-                "fallback_to_tutk: failed to parse resolved TUTK URL");
-        return false;
-    }
-
-    if (new_url.device.empty()) new_url.device = dev_id;
 
     // Clean up LAN/TLS resources before switching to TUTK
     {
@@ -926,7 +1016,40 @@ static bool fallback_to_tutk(Tunnel* t)
         t->rtsp_pass.reset();
     }
 
-    t->url = std::move(new_url);
+    if (!adopt_url(t, tutk_url)) {
+        log_fmt(t->logger, t->log_ctx,
+                "fallback_to_tutk: failed to parse resolved TUTK URL");
+        return false;
+    }
+    log_fmt(t->logger, t->log_ctx, "fallback_to_tutk: switched to TUTK for dev=%s",
+            dev_id.c_str());
+    return true;
+}
+
+// TUTK tunnel opened for the file browser: our TUTK client carries video
+// only, so switch the CTRL channel to the printer's LAN :6000 route.
+static bool fallback_to_lan(Tunnel* t)
+{
+    const std::string dev_id = t->url.device;
+    std::string lan_url = query_plugin("obn_get_lan_camera_url", dev_id);
+    if (lan_url.empty() || !adopt_url(t, lan_url) || t->url.scheme != Scheme::Local) {
+        log_fmt(t->logger, t->log_ctx,
+                "fallback_to_lan: no LAN route for dev=%s", dev_id.c_str());
+        set_last_error("file browser over TUTK is not supported and no LAN route is known");
+        return false;
+    }
+    obn::lan_tls::registry_put_ip_serial(t->url.host, t->url.device);
+    log_fmt(t->logger, t->log_ctx, "fallback_to_lan: dialing tls://%s:%d for dev=%s",
+            t->url.host.c_str(), t->url.port, dev_id.c_str());
+    const char* serial = t->url.device.empty() ? nullptr : t->url.device.c_str();
+    if (obn::tls::dial_tls(t->url.host, t->url.port, /*timeout_ms=*/5000,
+                           &t->fd, &t->ssl, serial) != 0) {
+        log_fmt(t->logger, t->log_ctx, "fallback_to_lan: TLS dial failed: %s",
+                obn::source::get_last_error());
+        return false;
+    }
+    t->t0      = std::chrono::steady_clock::now();
+    t->started = true;
     return true;
 }
 
@@ -1860,7 +1983,8 @@ OBN_EXPORT int Bambu_Create(Bambu_Tunnel* tunnel, char const* path)
             scheme_name, t->url.host.c_str(), t->url.port,
             t->url.path.c_str(), t->url.user.c_str(),
             t->url.passwd.empty() ? "(empty!)" : "***");
-    if (!t->url.device.empty() && !t->url.host.empty()) {
+    fill_device_from_ip(&t->url);
+    if (t->url.scheme != Scheme::Tutk && !t->url.device.empty() && !t->url.host.empty()) {
         obn::lan_tls::registry_put_ip_serial(t->url.host, t->url.device);
     }
     *tunnel = t;
@@ -1879,6 +2003,17 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
 {
     auto* t = static_cast<Tunnel*>(tunnel);
     if (!t) return -1;
+
+    // lv=rtsps/rtsp: video starts in Bambu_StartStream, not here. Skip the
+    // :6000 TLS dial so a blocked CTRL port does not fail an RTSP liveview
+    // (or the TUTK fallback that StartStream runs after RTSP fails).
+    if (t->url.scheme == Scheme::Local &&
+        (t->url.lv == "rtsps" || t->url.lv == "rtsp")) {
+        log_fmt(t->logger, t->log_ctx,
+                "Bambu_Open: lv=%s, deferring video to StartStream",
+                t->url.lv.c_str());
+        return Bambu_success;
+    }
 
     // RTSP(S) is so different from MJPG that it gets its own code path
     // (passthrough worker + RTSP handshake); MJPG stays as manual
@@ -1899,9 +2034,12 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
         return rc;
     }
 
-    // TUTK cloud / relay liveview (off-LAN or remote)
+    // TUTK: the same tunnel may be opened for video (Bambu_StartStream) or
+    // for the file browser (Bambu_StartStreamEx CTRL), and only video goes
+    // over TUTK, so defer all network I/O until we know which.
     if (t->url.scheme == Scheme::Tutk) {
-        return open_tutk(t);
+        log_fmt(t->logger, t->log_ctx, "Bambu_Open: TUTK tunnel, deferring connect");
+        return Bambu_success;
     }
 
     log_fmt(t->logger, t->log_ctx, "Bambu_Open: dialing tls://%s:%d",
@@ -1979,7 +2117,8 @@ OBN_EXPORT int Bambu_StartStream(Bambu_Tunnel tunnel, bool /*video*/)
         return rc;
     }
 
-    if (t->url.scheme == Scheme::Tutk) return Bambu_success;
+    if (t->url.scheme == Scheme::Tutk)
+        return t->tutk_source ? Bambu_success : open_tutk(t);
     if (t->url.scheme == Scheme::Local && !t->ssl) return -1;
     if ((t->url.scheme == Scheme::Rtsps ||
          t->url.scheme == Scheme::Rtsp) && !t->rtsp_pass) return -1;
@@ -2020,6 +2159,7 @@ OBN_EXPORT int Bambu_StartStreamEx(Bambu_Tunnel tunnel, int type)
     // CTRL_TYPE (0x3001) opens the PrinterFileSystem channel: keep TLS
     // :6000 open and forward CTRL JSON to printer firmware.
     if (type == kCtrlType) {
+        if (t->url.scheme == Scheme::Tutk && !fallback_to_lan(t)) return -1;
         return start_native_ctrl_handshake(t);
     }
     return Bambu_StartStream(tunnel, true);
@@ -2032,7 +2172,11 @@ OBN_EXPORT int Bambu_GetStreamCount(Bambu_Tunnel tunnel)
     if (t->url.scheme == Scheme::Tutk) {
         return (t->tutk_source && t->tutk_source->is_open()) ? 1 : 0;
     }
-    if (t->url.scheme == Scheme::Local && !t->ssl)      return 0;
+    if (t->url.scheme == Scheme::Local && !t->ssl) {
+        // Open deferred the :6000 dial for lv= RTSP(S) video.
+        if (t->url.lv == "rtsps" || t->url.lv == "rtsp") return 1;
+        return 0;
+    }
     if ((t->url.scheme == Scheme::Rtsps ||
          t->url.scheme == Scheme::Rtsp) && !t->rtsp_pass) return 0;
     return 1; // one video track (MJPEG for local-scheme, AVC1 for RTSP).
@@ -2118,7 +2262,7 @@ OBN_EXPORT int Bambu_ReadSample(Bambu_Tunnel tunnel, Bambu_Sample* sample)
         return read_rtsp(t, sample);
     }
 
-    // TUTK: pull from OssTutkCameraSource.
+    // TUTK: pull from TutkCameraSource.
     if (t->url.scheme == Scheme::Tutk) {
         return read_tutk(t, sample);
     }

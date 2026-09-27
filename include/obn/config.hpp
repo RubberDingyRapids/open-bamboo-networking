@@ -61,6 +61,12 @@ struct Settings {
     // Device panel: static "Printer Preview" JPEG (kCameraPreviewMemPath).
     bool disable_camera_preview      = false;
 
+    // get_camera_url for a cloud-bound printer: prefer the LAN URL
+    // (RTSP(S) / :6000) when the printer answers a short TCP probe;
+    // fall back to TUTK if LAN is down and credentials can be minted.
+    // Off by default, matching the stock plugin.
+    bool prefer_rtsp                 = false;
+
     // MQTT connection persistence: Orca Slicer unconditionally tears down
     // and re-establishes the MQTT session after every print job, causing a
     // 5-30s reconnection delay.  Enabled by default to work around this.

@@ -325,6 +325,7 @@ add_library(bambu_networking SHARED
     src/abi_ft.cpp
     src/agent.cpp
     src/auth.cpp
+    src/camera_url.cpp
     src/cert_store.cpp
     src/config.cpp
     src/cloud_auth.cpp
@@ -355,18 +356,9 @@ add_library(bambu_networking SHARED
     src/tunnel_local.cpp
     src/tunnel_upload.cpp
     src/tls_dial.cpp
-    src/camera.cpp
-    src/camera/AgoraUrl.cpp
-    src/camera/CameraSourceFactory.cpp
-    src/camera/JpegCameraSource.cpp
-    src/camera/OssTutkCameraSource.cpp
-    src/camera/oss_agora/OssAgoraBambuSource.cpp
-    src/camera/oss_agora/OssAgoraEngine.cpp
-    src/camera/oss_agora/OssAgoraSignaling.cpp
-    src/camera/oss_tutk/IotcClient.cpp
 )
 
-target_include_directories(bambu_networking PRIVATE include src ${OBN_GENERATED_DIR})
+target_include_directories(bambu_networking PRIVATE include ${OBN_GENERATED_DIR})
 set(_obn_git_compile_defs "")
 if(OBN_GIT_COMMIT)
     list(APPEND _obn_git_compile_defs OBN_GIT_COMMIT="${OBN_GIT_COMMIT}")
@@ -470,12 +462,10 @@ set(_obn_bambusource_sources
     src/lan_tls.cpp
     src/log.cpp
     src/os_compat.cpp
-    src/camera/AgoraUrl.cpp
-    src/camera/OssTutkCameraSource.cpp
-    src/camera/oss_agora/OssAgoraBambuSource.cpp
-    src/camera/oss_agora/OssAgoraEngine.cpp
-    src/camera/oss_agora/OssAgoraSignaling.cpp
-    src/camera/oss_tutk/IotcClient.cpp
+    src/camera/TutkCameraSource.cpp
+    src/camera/tutk/TutkSession.cpp
+    src/camera/tutk/IotcClient.cpp
+    src/camera/tutk/Fec.cpp
 )
 if(WIN32)
     list(APPEND _obn_bambusource_sources
@@ -804,6 +794,12 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_include_directories(h264_avcc_test PRIVATE stubs)
     add_test(NAME h264_avcc COMMAND h264_avcc_test)
 
+    # Reed-Solomon recovery of the TUTK AV transport FEC groups.
+    add_executable(tutk_fec_test tests/tutk_fec_test.cpp
+        src/camera/tutk/Fec.cpp)
+    target_include_directories(tutk_fec_test PRIVATE src/camera/tutk)
+    add_test(NAME tutk_fec COMMAND tutk_fec_test)
+
     # Hermetic unit test for obn::auth::Store persistence, specifically
     # the firmware_beta_open field (profile setting.isFirmwareBetaOpen)
     # and backwards compatibility loading old JSON files without that field.
@@ -818,6 +814,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     add_executable(lan_live_test tests/lan_live_test.cpp
         src/agent.cpp
         src/auth.cpp
+        src/camera_url.cpp
         src/cert_store.cpp
         src/config.cpp
         src/cloud_auth.cpp
@@ -891,6 +888,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     set(OBN_TEST_CORE_SOURCES
         src/agent.cpp
         src/auth.cpp
+        src/camera_url.cpp
         src/cert_store.cpp
         src/config.cpp
         src/cloud_auth.cpp
@@ -1018,5 +1016,12 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         ABI_VERSION=${OBN_ABI_VERSION_HEX})
     target_link_libraries(lan_bind_tcp_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME lan_bind_tcp COMMAND lan_bind_tcp_test)
+
+    # Unit tests for packed key parsing, ttcode body/response, and URL minting.
+    add_executable(camera_url_test tests/camera_url_test.cpp
+        src/camera_url.cpp
+        src/json_lite.cpp)
+    target_include_directories(camera_url_test PRIVATE include)
+    add_test(NAME camera_url COMMAND camera_url_test)
 
 endif()
