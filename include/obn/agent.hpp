@@ -608,6 +608,12 @@ private:
                                                 liveview_prepared_at_;
     std::condition_variable                     tutk_ready_cv_;
 
+    // task_ids for which we already re-dispatched a rescued project_file.
+    std::set<std::string>                       rescued_tasks_;
+
+    void rescue_cloud_project_file(const std::string& dev_id,
+                                   const std::string& json);
+
     // Devices seen on the current cloud session (first report flips them in).
     // disconnect_cloud drains this set to release the RSA pubkeys learned
     // while it lasted. Cleared on disconnect/resubscribe.
