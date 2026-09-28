@@ -2,6 +2,7 @@
 
 #include "obn/bambu_networking.hpp"
 #include "obn/config.hpp"
+#include "obn/lan_tls.hpp"
 #include "obn/log.hpp"
 #include "obn/mqtt_client.hpp"
 
@@ -109,15 +110,16 @@ int CloudSession::start(ConnectedCb on_connected,
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
 
+    std::shared_ptr<mqtt::Client> client;
     try {
-        client_ = std::make_unique<mqtt::Client>(make_client_id(user_id));
+        client = std::make_shared<mqtt::Client>(make_client_id(user_id));
     } catch (const std::exception& e) {
         OBN_ERROR("cloud mqtt::Client ctor failed: %s", e.what());
         started_.store(false, std::memory_order_release);
         return BAMBU_NETWORK_ERR_CONNECT_FAILED;
     }
 
-    client_->set_on_connect([this](int rc) {
+    client->set_on_connect([this](int rc) {
         int reason = 0;
         int status = map_connack_to_status(rc, reason);
         if (rc == 0) {
@@ -145,7 +147,7 @@ int CloudSession::start(ConnectedCb on_connected,
         }
     });
 
-    client_->set_on_disconnect([this](int rc) {
+    client->set_on_disconnect([this](int rc) {
         connected_.store(false, std::memory_order_release);
         OBN_WARN("cloud mqtt disconnect rc=%d (%s)", rc, mqtt::Client::err_str(rc));
         ConnectedCb cb;
@@ -163,7 +165,7 @@ int CloudSession::start(ConnectedCb on_connected,
         }
     });
 
-    client_->set_on_message([this](const mqtt::Message& msg) {
+    client->set_on_message([this](const mqtt::Message& msg) {
         // Topic is device/<dev_id>/report. Pull the dev_id out; any
         // other topic shape we ignore (shouldn't happen - we only ever
         // subscribe to report topics).
@@ -193,33 +195,39 @@ int CloudSession::start(ConnectedCb on_connected,
     cfg.username     = "u_" + user_id;
     cfg.password     = token;
     cfg.use_tls      = true;
-    // Cloud broker runs a real publicly-trusted cert, so we verify.
-    cfg.tls_insecure = false;
-    cfg.ca_file      = ca_file; // optional override; empty -> system store
-    cfg.keepalive_s  = 60;
-#if defined(_WIN32)
-    // Windows MVP: ca_file (above) is the BBL slicer bundle that
-    // Agent::connect_cloud forwards us. It's the only PEM we can hand
-    // mosquitto_tls_set on this platform (the static OpenSSL ships no
-    // default trust dir), but its roots don't sign *.bambulab.com.
-    // Skip both the chain check and the hostname check, so the SSL
-    // handshake doesn't reject a perfectly-valid public cert just
-    // because we can't anchor it. Cloud auth remains gated by the
-    // bearer token in `password`, so an MITM still can't impersonate
-    // the user. See agent.cpp Agent::connect_cloud for the rationale.
-    if (!ca_file.empty()) {
-        cfg.tls_skip_chain_verify = true;
-        cfg.tls_insecure          = true;
+    // Cloud broker runs a real, publicly-trusted (DigiCert) cert, so we
+    // verify both the chain and the hostname. On Windows, ca_file (below)
+    // is Agent::connect_cloud's vendored standard CA bundle
+    // (obn::tls::kCloudCaBundlePem) rather than a Bambu-specific one, so
+    // it actually chains.
+    //
+    // lan_tls_skip_verify / OBN_SKIP_TLS_VERIFY turns both checks off here
+    // too: it is the escape hatch for a TLS-inspecting proxy whose root is
+    // not in the vendored bundle, or for a bundle that has gone stale.
+    const bool verify         = obn::lan_tls::verify_enabled();
+    cfg.tls_insecure          = !verify;
+    cfg.tls_skip_chain_verify = !verify;
+    cfg.ca_file               = ca_file; // optional override; empty -> system store
+    cfg.keepalive_s           = 60;
+
+    OBN_INFO("cloud mqtt: connecting to %s:%d as u_%s (token=%zu bytes, "
+             "tls_verify=%d)",
+             cfg.host.c_str(), cfg.port, user_id.c_str(), token.size(),
+             verify ? 1 : 0);
+
+    // Published before connect(): the CONNACK callback subscribes via client_.
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        client_ = client;
     }
-#endif
-
-    OBN_INFO("cloud mqtt: connecting to %s:%d as u_%s (token=%zu bytes)",
-             cfg.host.c_str(), cfg.port, user_id.c_str(), token.size());
-
-    int rc = client_->connect(cfg);
+    int rc = client->connect(cfg);
     if (rc != MOSQ_ERR_SUCCESS) {
         OBN_ERROR("cloud mqtt connect_async rc=%d (%s)",
                   rc, mqtt::Client::err_str(rc));
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            client_.reset();
+        }
         started_.store(false, std::memory_order_release);
         return BAMBU_NETWORK_ERR_CONNECT_FAILED;
     }
@@ -229,10 +237,15 @@ int CloudSession::start(ConnectedCb on_connected,
 void CloudSession::stop()
 {
     if (!started_.exchange(false, std::memory_order_acq_rel)) return;
-    if (client_) {
-        client_->disconnect();
-        client_.reset();
+    std::shared_ptr<mqtt::Client> client;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        client = std::move(client_);
     }
+    // Joins the loop thread, so mu_ must not be held: its callbacks take it.
+    // A publisher still holding a snapshot keeps the object alive; its final
+    // release is then a plain mosquitto_destroy.
+    if (client) client->disconnect();
     connected_.store(false, std::memory_order_release);
     std::lock_guard<std::mutex> lk(mu_);
     active_.clear();
@@ -302,11 +315,16 @@ int CloudSession::publish(const std::string& dev_id,
                           const std::string& json_str,
                           int qos)
 {
-    if (!client_ || !connected_.load(std::memory_order_acquire)) {
+    std::shared_ptr<mqtt::Client> client;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        client = client_;
+    }
+    if (!client || !connected_.load(std::memory_order_acquire)) {
         OBN_WARN("cloud mqtt: publish to %s while disconnected", dev_id.c_str());
         return BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
     }
-    int rc = client_->publish(request_topic_(dev_id), json_str, qos, /*retain=*/false);
+    int rc = client->publish(request_topic_(dev_id), json_str, qos, /*retain=*/false);
     if (rc != MOSQ_ERR_SUCCESS) {
         OBN_WARN("cloud mqtt: publish to %s rc=%d (%s)",
                  dev_id.c_str(), rc, mqtt::Client::err_str(rc));

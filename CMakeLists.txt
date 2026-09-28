@@ -98,6 +98,59 @@ configure_file(
     "${OBN_GENERATED_DIR}/obn_conf_default.h"
     @ONLY)
 
+# Compile in a standard root CA bundle (see include/obn/cloud_ca_bundle.hpp
+# for why: Windows has no usable default trust store for mosquitto/OpenSSL
+# to validate the cloud MQTT broker against). Linux/macOS use the system
+# trust store, so the bundle is Windows-only.
+#
+# MSVC caps a single string literal at 65535 bytes (C2026 "string too big"),
+# well under the ~189 KB bundle, so split it into chunks and emit them as
+# adjacent raw-string literals -- the compiler concatenates those into one
+# string constant at compile time with no limit on the total length. Chunks
+# end on a newline: the bundle has non-ASCII CA names, and under /utf-8 a
+# literal that starts or ends mid-sequence gets mangled.
+set(OBN_CLOUD_CA_SOURCES "")
+if(WIN32)
+    set(_obn_cacert_path "${CMAKE_CURRENT_SOURCE_DIR}/resources/cacert.pem")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 "${_obn_cacert_path}")
+    file(READ "${_obn_cacert_path}" _obn_cacert_full)
+    string(LENGTH "${_obn_cacert_full}" _obn_cacert_len)
+    set(_obn_chunk_size 8000)
+    set(OBN_CA_BUNDLE_CHUNKS "")
+    set(_obn_chunk_index 0)
+    set(_obn_pos 0)
+    while(_obn_pos LESS _obn_cacert_len)
+        math(EXPR _obn_remaining "${_obn_cacert_len} - ${_obn_pos}")
+        if(_obn_remaining GREATER _obn_chunk_size)
+            string(SUBSTRING "${_obn_cacert_full}" ${_obn_pos} ${_obn_chunk_size}
+                   _obn_chunk)
+            string(FIND "${_obn_chunk}" "\n" _obn_nl REVERSE)
+            if(_obn_nl LESS 0)
+                message(FATAL_ERROR
+                    "resources/cacert.pem: no newline within ${_obn_chunk_size} bytes "
+                    "at offset ${_obn_pos}")
+            endif()
+            math(EXPR _obn_len "${_obn_nl} + 1")
+            string(SUBSTRING "${_obn_chunk}" 0 ${_obn_len} _obn_chunk)
+        else()
+            set(_obn_len ${_obn_remaining})
+            string(SUBSTRING "${_obn_cacert_full}" ${_obn_pos} ${_obn_len} _obn_chunk)
+        endif()
+        string(APPEND OBN_CA_BUNDLE_CHUNKS
+            "    R\"OBN_PEM_${_obn_chunk_index}(${_obn_chunk})OBN_PEM_${_obn_chunk_index}\"\n")
+        math(EXPR _obn_pos "${_obn_pos} + ${_obn_len}")
+        math(EXPR _obn_chunk_index "${_obn_chunk_index} + 1")
+    endwhile()
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/cloud_ca_bundle_data.cpp.in"
+        "${OBN_GENERATED_DIR}/cloud_ca_bundle_data.cpp"
+        @ONLY)
+    set(OBN_CLOUD_CA_SOURCES
+        src/cloud_ca_bundle.cpp
+        "${OBN_GENERATED_DIR}/cloud_ca_bundle_data.cpp")
+endif()
+
 option(OBN_RELEASE "Build a release (show project version instead of commit hash)" OFF)
 
 # Extract OBN_PROJECT_VERSION from the single source of truth: include/obn/version.hpp
@@ -335,6 +388,7 @@ add_library(bambu_networking SHARED
     src/cloud_presets.cpp
     src/cloud_print.cpp
     src/cloud_session.cpp
+    ${OBN_CLOUD_CA_SOURCES}
     src/cover_cache.cpp
     src/cover_server.cpp
     src/ftps.cpp
@@ -787,6 +841,20 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_include_directories(tunnel_local_test PRIVATE include stubs ${OBN_GENERATED_DIR})
     target_link_libraries(tunnel_local_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME tunnel_local COMMAND tunnel_local_test)
+
+    add_executable(json_lite_test tests/json_lite_test.cpp src/json_lite.cpp)
+    target_include_directories(json_lite_test PRIVATE include)
+    add_test(NAME json_lite COMMAND json_lite_test)
+
+    add_executable(http_redact_test tests/http_redact_test.cpp
+        src/http_client.cpp
+        src/log.cpp
+        src/os_compat.cpp)
+    target_include_directories(http_redact_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(http_redact_test PRIVATE
+        OBN_VERSION_STRING="${OBN_VERSION}")
+    target_link_libraries(http_redact_test PRIVATE obn_curl_iface)
+    add_test(NAME http_redact COMMAND http_redact_test)
 
     # Portable Annex-B → AVCC helper used by the macOS BambuPlayer adapter.
     add_executable(h264_avcc_test tests/h264_avcc_test.cpp

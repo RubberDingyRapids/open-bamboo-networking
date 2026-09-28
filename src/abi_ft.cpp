@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -409,18 +410,24 @@ void run_upload_job(FT_Tunnel* t, FT_Job* j)
     };
 
     obn::tunnel_upload::UploadOutcome outcome;
+    std::string connect_err;
     {
         std::lock_guard<std::mutex> lk(t->lan_mu);
-        if (std::string err = connect_lan_tunnel(t); !err.empty()) {
-            OBN_WARN("ft: upload: connect failed: %s", err.c_str());
-            deliver_result(j, FT_EIO, 0, {});
-            return;
+        connect_err = connect_lan_tunnel(t);
+        if (connect_err.empty()) {
+            outcome = t->conn->upload(req, cb);
         }
-        outcome = t->conn->upload(req, cb);
     }
 
     // Never call result_cb under lan_mu — Studio's FileTransferObject invokes
-    // ft_tunnel_shutdown() from the result callback (one-shot mem download).
+    // ft_tunnel_shutdown() from the result callback (one-shot mem download),
+    // which re-locks lan_mu; calling it while still holding the lock above
+    // would deadlock.
+    if (!connect_err.empty()) {
+        OBN_WARN("ft: upload: connect failed: %s", connect_err.c_str());
+        deliver_result(j, FT_EIO, 0, {});
+        return;
+    }
     if (outcome.ok) {
         deliver_result(j, 0, outcome.wire_result, {});
         return;
@@ -457,16 +464,21 @@ void run_download_job(FT_Tunnel* t, FT_Job* j)
     };
 
     obn::tunnel_upload::DownloadOutcome outcome;
+    std::string connect_err;
     {
         std::lock_guard<std::mutex> lk(t->lan_mu);
-        if (std::string err = connect_lan_tunnel(t); !err.empty()) {
-            OBN_WARN("ft: download: connect failed: %s", err.c_str());
-            deliver_result(j, FT_EIO, 0, {});
-            return;
+        connect_err = connect_lan_tunnel(t);
+        if (connect_err.empty()) {
+            outcome = t->conn->download(req, cb);
         }
-        outcome = t->conn->download(req, cb);
     }
 
+    // Never call result_cb under lan_mu — see run_upload_job().
+    if (!connect_err.empty()) {
+        OBN_WARN("ft: download: connect failed: %s", connect_err.c_str());
+        deliver_result(j, FT_EIO, 0, {});
+        return;
+    }
     if (outcome.ok) {
         OBN_DEBUG("ft: download ok path=%s bytes=%zu reply=%.200s",
                  req.path.c_str(), outcome.data.size(),
@@ -484,20 +496,50 @@ void run_download_job(FT_Tunnel* t, FT_Job* j)
     deliver_result(j, FT_EIO, outcome.wire_result >= 0 ? outcome.wire_result : 0, {});
 }
 
+// Called when a job body threw. The throw may have come mid-transfer, leaving
+// the shared TLS session half-way through a frame, so drop it and let the next
+// job reconnect. The throw may also have come after the job already reported,
+// in which case Studio must not see a second result.
+void fail_job_after_exception(FT_Tunnel* t, FT_Job* j)
+{
+    {
+        std::lock_guard<std::mutex> lk(t->lan_mu);
+        if (t->conn) t->conn->disconnect();
+    }
+    bool finished = false;
+    {
+        std::lock_guard<std::mutex> lk(j->mu);
+        finished = j->finished;
+    }
+    if (!finished) deliver_result(j, FT_EIO, 0, {});
+}
+
 void spawn_job(FT_Tunnel* t, FT_Job* j)
 {
     retain(t);
     retain(j);
     std::thread([t, j] {
-        switch (j->cmd_type) {
-        case kCmdTypeMediaAbility: run_ability_job(t, j); break;
-        case kCmdTypeUpload:       run_upload_job(t, j);  break;
-        case kCmdTypeDownload:     run_download_job(t, j); break;
-        default:
-            OBN_WARN("ft: unknown cmd_type=%d (raw=%.200s)",
-                     j->cmd_type, j->raw_params.c_str());
-            deliver_result(j, FT_EIO, 0, {});
-            break;
+        // A job thread runs detached; an exception escaping it terminates the
+        // whole host process (Studio/Orca), not just this job. Wire data
+        // (printer replies) feeds these code paths, so treat any unexpected
+        // exception as a failed job rather than letting it propagate.
+        try {
+            switch (j->cmd_type) {
+            case kCmdTypeMediaAbility: run_ability_job(t, j); break;
+            case kCmdTypeUpload:       run_upload_job(t, j);  break;
+            case kCmdTypeDownload:     run_download_job(t, j); break;
+            default:
+                OBN_WARN("ft: unknown cmd_type=%d (raw=%.200s)",
+                         j->cmd_type, j->raw_params.c_str());
+                deliver_result(j, FT_EIO, 0, {});
+                break;
+            }
+        } catch (const std::exception& e) {
+            OBN_WARN("ft: job cmd_type=%d threw: %s", j->cmd_type, e.what());
+            fail_job_after_exception(t, j);
+        } catch (...) {
+            OBN_WARN("ft: job cmd_type=%d threw non-std::exception", j->cmd_type);
+            fail_job_after_exception(t, j);
         }
         release(j);
         release(t);
@@ -514,8 +556,15 @@ OBN_ABI ft_err ft_tunnel_start_connect(FT_TunnelHandle* h, ft_tunnel_connect_cb 
     t->conn_user = user;
 
     if (t->is_lan) {
-        std::lock_guard<std::mutex> lk(t->lan_mu);
-        if (std::string err = connect_lan_tunnel(t); !err.empty()) {
+        std::string err;
+        {
+            std::lock_guard<std::mutex> lk(t->lan_mu);
+            err = connect_lan_tunnel(t);
+        }
+        // Never call Studio's callbacks under lan_mu: a failed connect makes
+        // FileTransferObject fail its pending requests, which can reach
+        // reset_locked() -> ft_tunnel_shutdown() and re-lock lan_mu.
+        if (!err.empty()) {
             OBN_WARN("ft: start_connect: %s", err.c_str());
             if (cb) cb(user, /*ok=*/1, /*err=*/FT_EIO, err.c_str());
             if (t->status_cb) {

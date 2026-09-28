@@ -42,16 +42,17 @@ bool tcp_open(const std::string& host, int port, int timeout_ms)
     return true;
 }
 
-// Short TCP probe of the :6000 CTRL port and, when lv= says so, the
-// RTSP(S) video port. iptables DROP needs the timeout; REJECT is instant.
+// Short TCP probe of the port the video will come from: RTSP(S) when lv=
+// says so, otherwise MJPEG on :6000. The :6000 CTRL port alone proves
+// nothing for RTSP printers. iptables DROP needs the timeout; REJECT is
+// instant.
 bool lan_camera_reachable(const std::string& lan_url)
 {
     obn::camera::LocalCameraUrl u;
     if (!obn::camera::parse_local_camera_url(lan_url, u)) return false;
     constexpr int kTimeoutMs = 400;
-    if (tcp_open(u.ip, u.ctrl_port, kTimeoutMs)) return true;
-    if (u.video_port > 0 && tcp_open(u.ip, u.video_port, kTimeoutMs)) return true;
-    return false;
+    return tcp_open(u.ip, u.video_port > 0 ? u.video_port : u.ctrl_port,
+                    kTimeoutMs);
 }
 
 void deliver_camera_url(const std::function<void(std::string)>& callback,
@@ -71,15 +72,17 @@ void deliver_camera_url(const std::function<void(std::string)>& callback,
 // the local URL itself (research/08.11). Two answers are possible:
 //
 //   bambu:///tutk?uid=<ttcode>&authkey=..&passwd=..&region=..   (cloud mint)
-//   bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>[&lv=rtsps]
+//   bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>[&lv=rtsps|rtsp|off]
 //
 // Like the stock plugin we mint TUTK by default: POST /user/ttcode returns
 // the printer's TUTK credentials and makes the cloud push liveview.prepare,
 // which starts the printer's tutk_server. The LAN URL is used instead when
-// prefer_rtsp is set (and the printer answers a short TCP probe), when the
+// prefer_lan_over_tutk is set (and the printer answers a short TCP probe on
+// its video port; ignored while the printer reports LAN liveview off), when the
 // cloud is unusable (block_cloud, no session) or when the mint fails,
-// provided the printer's IP + access code are known. If prefer_rtsp is set
-// but LAN is down and TUTK credentials exist, the callback is the TUTK URL.
+// provided the printer's IP + access code are known. If
+// prefer_lan_over_tutk is set but LAN is down and TUTK credentials exist,
+// the callback is the TUTK URL.
 // If neither path works the callback is a non-bambu:/// string so Studio
 // shows its generic "Connection Failed" status instead of the LAN IP dialog.
 // Studio only checks that a success reply starts with "bambu:///", so the
@@ -102,14 +105,23 @@ OBN_ABI int bambu_network_get_camera_url(void* agent,
 
     std::string lan_url = a->camera_url_for(serial);
     const bool cloud_usable = cloud_camera_usable(a);
-    const bool prefer_rtsp  = obn::config::current().prefer_rtsp;
+    // With LAN Only Liveview off the LAN URL still serves the file browser
+    // (CTRL :6000) but carries no video, so prefer_lan_over_tutk must not
+    // pick it.
+    const bool lan_video_off = a->lan_liveview_off(serial);
+    const bool prefer_lan    = obn::config::current().prefer_lan_over_tutk;
+    if (prefer_lan && lan_video_off && !lan_url.empty())
+        OBN_INFO("get_camera_url dev=%s: LAN liveview is off on the printer, "
+                 "ignoring prefer_lan_over_tutk", serial.c_str());
 
-    // Cloud URL minting is an HTTP POST (and prefer_rtsp may probe LAN).
+    // Cloud URL minting is an HTTP POST (and prefer_lan_over_tutk may probe
+    // LAN).
     // Offload so Studio's UI / MediaPlayCtrl thread returns immediately.
-    auto work = [a, dev_id, serial, lan_url, callback, cloud_usable, prefer_rtsp]() {
-        if (!lan_url.empty() && prefer_rtsp) {
+    auto work = [a, dev_id, serial, lan_url, callback, cloud_usable,
+                 prefer_lan = prefer_lan && !lan_video_off]() {
+        if (!lan_url.empty() && prefer_lan) {
             if (lan_camera_reachable(lan_url)) {
-                deliver_camera_url(callback, serial, lan_url, "LAN URL (prefer_rtsp)");
+                deliver_camera_url(callback, serial, lan_url, "LAN URL (prefer_lan_over_tutk)");
                 return;
             }
             OBN_INFO("get_camera_url dev=%s: LAN unreachable, trying TUTK",
@@ -118,7 +130,7 @@ OBN_ABI int bambu_network_get_camera_url(void* agent,
                 std::string url = a->remote_camera_url(dev_id);
                 if (!url.empty()) {
                     deliver_camera_url(callback, serial, std::move(url),
-                                       "TUTK cloud URL (prefer_rtsp fallback)");
+                                       "TUTK cloud URL (prefer_lan_over_tutk fallback)");
                     return;
                 }
             }

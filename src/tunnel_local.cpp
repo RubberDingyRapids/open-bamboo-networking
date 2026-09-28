@@ -366,14 +366,24 @@ bool parse_upload_init_reply(const std::string& wire_json,
     auto reply = root->find("reply");
     if (!reply.is_object()) return false;
 
-    const std::uint32_t kb =
-        static_cast<std::uint32_t>(reply.find("chunk_size").as_int(0));
-    if (!kb) return false;
+    // Observed real firmware reports chunk_size in the low hundreds (e.g. 255
+    // on a P2S, see research/06.04-port-6000.md). This field drives a
+    // buffer_size = chunk_size_kb * 1024 allocation in the upload path, so a
+    // malicious/corrupted reply must not be allowed to request a
+    // multi-gigabyte buffer. 64 MiB is generously above anything real
+    // firmware sends while keeping the worst case allocation bounded.
+    constexpr std::uint32_t kMaxChunkSizeKb = 64 * 1024;
+    const std::int64_t raw_kb = reply.find("chunk_size").as_int(0);
+    if (raw_kb <= 0 || raw_kb > kMaxChunkSizeKb) return false;
+    const std::uint32_t kb = static_cast<std::uint32_t>(raw_kb);
+
+    // Resume offset. A negative value would wrap to ~2^64 and send the
+    // resume-prefix hashing loop reading to EOF before it fails.
+    const std::int64_t raw_offset = reply.find("offset").as_int(0);
+    if (raw_offset < 0) return false;
 
     if (chunk_size_kb) *chunk_size_kb = kb;
-    if (offset) {
-        *offset = static_cast<std::uint64_t>(reply.find("offset").as_int(0));
-    }
+    if (offset) *offset = static_cast<std::uint64_t>(raw_offset);
     return true;
 }
 

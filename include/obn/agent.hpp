@@ -64,6 +64,7 @@ public:
 private:
     std::string report_topic_() const;
     std::string request_topic_() const;
+    std::shared_ptr<mqtt::Client> client_snapshot_() const;
 
     std::string dev_id_;
     std::string dev_ip_;
@@ -72,7 +73,10 @@ private:
     bool        use_ssl_;
     std::string ca_file_;
 
-    std::unique_ptr<mqtt::Client> client_;
+    // Shared so publish_json()/is_connected() on another thread keep the
+    // client alive while disconnect() drops it.
+    mutable std::mutex            client_mu_;
+    std::shared_ptr<mqtt::Client> client_;
     ConnectedCb                   on_connected_;
     MessageCb                     on_message_;
     // Set on the first successful CONNACK. Disconnects before that are
@@ -406,7 +410,8 @@ public:
     void note_device_lan_ip(const std::string& dev_id,
                             const std::string& ip);
     // LAN route for bambu_network_get_camera_url (used instead of TUTK
-    // when prefer_rtsp is set and the printer answers a TCP probe, or when
+    // when prefer_lan_over_tutk is set and the printer's video port answers a TCP
+    // probe with LAN liveview on, or when
     // cloud credentials are unavailable). When the printer's LAN IP (SSDP /
     // connect_printer) and access code (connect_printer / cloud
     // dev_access_code) are both known we return
@@ -415,6 +420,10 @@ public:
     // hint — liveview can run over the local network. Returns "" when
     // either piece is missing.
     std::string camera_url_for(const std::string& dev_id);
+    // True when the printer's push_status reported ipcam.rtsp_url
+    // "disable" (LAN Only Liveview off on X2D/H2D/H2S-class printers).
+    // The :6000 CTRL port stays open then, but there is no LAN video.
+    bool lan_liveview_off(const std::string& dev_id) const;
     // Remote cloud camera URL for bambu_network_get_camera_url when the LAN
     // route is unavailable. Fetches TUTK credentials via /v1/iot-service/api/user/ttcode
     // and returns "bambu:///tutk?uid=...". The cloud itself pushes
@@ -498,9 +507,10 @@ private:
     bool developer_mode_effective(const std::string& dev_id) const;
 
     // Scans a push_status frame for ipcam.rtsp_url and latches the LAN
-    // liveview protocol ("rtsps"/"rtsp") per device. camera_url_for()
-    // forwards it as the lv= hint so libBambuSource knows to fetch video
-    // over RTSP(S) instead of MJPEG :6000 on X1/P1S/P2S-class printers.
+    // liveview protocol ("rtsps"/"rtsp", or "off" for "disable") per
+    // device. camera_url_for() forwards it as the lv= hint so
+    // libBambuSource knows to fetch video over RTSP(S) instead of MJPEG
+    // :6000 on X1/P1S/P2S-class printers, or that there is no LAN video.
     // Also learns the LAN IP from the same frame (see note_device_lan_ip).
     void harvest_media_caps(const std::string& dev_id,
                             const std::string& json);
@@ -539,7 +549,13 @@ private:
     std::string        remembered_machine_;
     std::map<std::string, std::string> extra_http_headers_;
 
-    std::unique_ptr<LanSession> lan_session_;
+    // lan_session_, discovery_ and cloud_session_ are shared so a caller can
+    // copy one under mu_ and keep using it after unlocking, while another
+    // thread swaps it out. Whoever takes one out of the member must call
+    // disconnect()/stop() itself: that joins the object's network thread, so
+    // the last release - possibly on some other thread - is then trivial and
+    // never lands on the object's own thread.
+    std::shared_ptr<LanSession> lan_session_;
 
     // Deferred disconnect for mqtt_keep_connection: instead of tearing down
     // the session immediately, we wait a few seconds for a reconnect with
@@ -555,8 +571,8 @@ private:
     // session right away, so the printer gets a clean MQTT DISCONNECT while we
     // are still alive to send it.
     void shutdown_lan_session();
-    std::unique_ptr<ssdp::Discovery> discovery_;
-    std::unique_ptr<CloudSession>   cloud_session_;
+    std::shared_ptr<ssdp::Discovery> discovery_;
+    std::shared_ptr<CloudSession>   cloud_session_;
     // Lazy localhost HTTP server that hands cover PNGs to Studio's
     // wxWebRequest. Only spun up when we first mint a synthetic
     // subtask id; destructor joins its accept loop.
@@ -675,7 +691,7 @@ private:
     // Reverse of the lan_tls ip->serial registry: last known LAN IP per
     // dev_id (SSDP / connect_printer). Used by camera_url_for().
     std::unordered_map<std::string, std::string> lan_ip_by_dev_;
-    // Latched LAN liveview protocol per dev_id ("rtsps"/"rtsp"), parsed
+    // Latched LAN liveview protocol per dev_id ("rtsps"/"rtsp"/"off"), parsed
     // from push_status ipcam.rtsp_url by harvest_media_caps().
     std::unordered_map<std::string, std::string> lan_lv_proto_by_dev_;
 

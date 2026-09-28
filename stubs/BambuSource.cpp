@@ -598,6 +598,9 @@ struct Tunnel {
     // ---- TUTK off-LAN / relay camera state (Scheme::Tutk) ----
     std::unique_ptr<obn::camera::TutkCameraSource> tutk_source;
     std::vector<uint8_t>       tutk_current_frame;
+    // File browser over TUTK (StartStreamEx CTRL on a tutk URL). Replies
+    // land in ctrl_out from the session's worker thread.
+    std::unique_ptr<obn::camera::tutk::TutkSession> tutk_ctrl;
 };
 
 void tunnel_close(Tunnel* t)
@@ -1026,8 +1029,28 @@ static bool fallback_to_tutk(Tunnel* t)
     return true;
 }
 
-// TUTK tunnel opened for the file browser: our TUTK client carries video
-// only, so switch the CTRL channel to the printer's LAN :6000 route.
+// Dials the Local-scheme :6000 TLS endpoint into t->fd / t->ssl.
+static bool dial_local_tls(Tunnel* t, const char* who)
+{
+    log_fmt(t->logger, t->log_ctx, "%s: dialing tls://%s:%d",
+            who, t->url.host.c_str(), t->url.port);
+    const char* serial = t->url.device.empty() ? nullptr : t->url.device.c_str();
+    if (obn::tls::dial_tls(t->url.host, t->url.port, /*timeout_ms=*/5000,
+                           &t->fd, &t->ssl, serial) != 0) {
+        log_fmt(t->logger, t->log_ctx, "%s: TLS dial failed: %s",
+                who, obn::source::get_last_error());
+        return false;
+    }
+    log_fmt(t->logger, t->log_ctx, "%s: TLS established (cipher=%s)",
+            who, SSL_get_cipher(t->ssl));
+    t->t0      = std::chrono::steady_clock::now();
+    t->started = true;
+    return true;
+}
+
+// TUTK tunnel opened for the file browser whose TUTK session did not come
+// up (legacy transport, unreachable) or with force_ftps set: switch the
+// CTRL channel to the printer's LAN :6000 route.
 static bool fallback_to_lan(Tunnel* t)
 {
     const std::string dev_id = t->url.device;
@@ -1039,18 +1062,7 @@ static bool fallback_to_lan(Tunnel* t)
         return false;
     }
     obn::lan_tls::registry_put_ip_serial(t->url.host, t->url.device);
-    log_fmt(t->logger, t->log_ctx, "fallback_to_lan: dialing tls://%s:%d for dev=%s",
-            t->url.host.c_str(), t->url.port, dev_id.c_str());
-    const char* serial = t->url.device.empty() ? nullptr : t->url.device.c_str();
-    if (obn::tls::dial_tls(t->url.host, t->url.port, /*timeout_ms=*/5000,
-                           &t->fd, &t->ssl, serial) != 0) {
-        log_fmt(t->logger, t->log_ctx, "fallback_to_lan: TLS dial failed: %s",
-                obn::source::get_last_error());
-        return false;
-    }
-    t->t0      = std::chrono::steady_clock::now();
-    t->started = true;
-    return true;
+    return dial_local_tls(t, "fallback_to_lan");
 }
 
 
@@ -1878,6 +1890,7 @@ static void native_ctrl_send_worker(Tunnel* t)
 static int start_native_ctrl_handshake(Tunnel* t)
 {
     if (!t->ssl) {
+        log_fmt(t->logger, t->log_ctx, "ctrl: TLS session not open");
         set_last_error("CTRL: TLS session not open");
         return -1;
     }
@@ -1920,6 +1933,61 @@ static int start_native_ctrl_handshake(Tunnel* t)
     return Bambu_success;
 }
 
+// File browser over TUTK, as the stock plugin does off-LAN: the printer
+// answers PrinterFileSystem JSON sent as IOCtrl 0x3001 on an AV session
+// that never starts the video stream. Blocks until the AV login is
+// accepted (the stock library connects inside Bambu_Open).
+static bool start_tutk_ctrl(Tunnel* t)
+{
+    obn::camera::tutk::TutkSessionParams p;
+    if (!obn::camera::parse_tutk_url(t->url.raw_url, p)) {
+        log_fmt(t->logger, t->log_ctx, "ctrl: malformed TUTK URL");
+        return false;
+    }
+    log_fmt(t->logger, t->log_ctx, "ctrl: starting file browser over TUTK");
+    auto s = std::make_unique<obn::camera::tutk::TutkSession>();
+    s->join(p, [t](const uint8_t* d, int n, int64_t, bool) {
+        CtrlReply r;
+        r.data.assign(reinterpret_cast<const char*>(d), static_cast<std::size_t>(n));
+        push_reply(t, std::move(r));
+    }, obn::camera::tutk::TutkSession::Mode::Ctrl);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (!s->is_ready() && s->is_joined() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (!s->is_ready()) {
+        log_fmt(t->logger, t->log_ctx, "ctrl: TUTK file-browser session did not start");
+        s->leave();
+        return false;
+    }
+    t->tutk_ctrl = std::move(s);
+    t->ctrl_mode = true;
+    log_fmt(t->logger, t->log_ctx, "ctrl: file browser over TUTK ready");
+    return true;
+}
+
+static int send_tutk_ctrl(Tunnel* t, const std::string& body)
+{
+    int cmdtype = 0, sequence = 0;
+    obn::json::Value req;
+    const bool parsed = parse_ctrl_request(body, &cmdtype, &sequence, &req);
+    if (parsed && cmdtype == kCmdFileDownload && camera_preview_disabled()) {
+        std::string path = req.find("path").as_string();
+        if (path.empty()) path = req.find("file").as_string();
+        if (path == obn::config::kCameraPreviewMemPath) {
+            stub_blocked_mem_download(t, sequence, path);
+            return Bambu_success;
+        }
+    }
+    log_fmt(t->logger, t->log_ctx, "ctrl: TUTK forward cmd=0x%04x seq=%d (%zu bytes)",
+            cmdtype, sequence, body.size());
+    if (!t->tutk_ctrl->send_ctrl(body)) {
+        set_last_error("CTRL over TUTK: request too long or session lost");
+        return -1;
+    }
+    return Bambu_success;
+}
+
 // Shuts the worker down. Idempotent.
 void stop_ctrl_mode(Tunnel* t)
 {
@@ -1930,6 +1998,10 @@ void stop_ctrl_mode(Tunnel* t)
         t->ctrl_cv.notify_all();
     }
     if (t->ctrl_worker.joinable()) t->ctrl_worker.join();
+    if (t->tutk_ctrl) {
+        t->tutk_ctrl->leave();
+        t->tutk_ctrl.reset();
+    }
     t->tl_session.reset();
     if (t->ftp) {
         t->ftp->quit();
@@ -2042,15 +2114,7 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
         return Bambu_success;
     }
 
-    log_fmt(t->logger, t->log_ctx, "Bambu_Open: dialing tls://%s:%d",
-            t->url.host.c_str(), t->url.port);
-
-    const char* serial =
-        t->url.device.empty() ? nullptr : t->url.device.c_str();
-    if (obn::tls::dial_tls(t->url.host, t->url.port, /*timeout_ms=*/5000,
-                           &t->fd, &t->ssl, serial) != 0) {
-        log_fmt(t->logger, t->log_ctx, "Bambu_Open: TLS dial failed: %s",
-                obn::source::get_last_error());
+    if (!dial_local_tls(t, "Bambu_Open")) {
         if (!t->url.device.empty()) {
             log_fmt(t->logger, t->log_ctx,
                     "Bambu_Open: attempting TUTK cloud fallback for dev=%s",
@@ -2062,12 +2126,6 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
         return -1;
     }
 
-    log_fmt(t->logger, t->log_ctx,
-            "Bambu_Open: TLS established (cipher=%s)",
-            SSL_get_cipher(t->ssl));
-
-    t->t0      = std::chrono::steady_clock::now();
-    t->started = true;
     log_fmt(t->logger, t->log_ctx,
             "Bambu_Open: TLS ready (MJPEG auth deferred to StartStream)");
     return Bambu_success;
@@ -2117,6 +2175,16 @@ OBN_EXPORT int Bambu_StartStream(Bambu_Tunnel tunnel, bool /*video*/)
         return rc;
     }
 
+    // lv=off: the printer reported LAN Only Liveview off. :6000 only
+    // serves CTRL then; an MJPEG auth there reads a short non-JPEG reply.
+    if (t->url.scheme == Scheme::Local && !t->ctrl_mode && t->url.lv == "off") {
+        log_fmt(t->logger, t->log_ctx,
+                "Bambu_StartStream: LAN Only Liveview is off on the printer");
+        if (!t->url.device.empty() && fallback_to_tutk(t)) return open_tutk(t);
+        set_last_error("LAN Only Liveview is off on the printer");
+        return -1;
+    }
+
     if (t->url.scheme == Scheme::Tutk)
         return t->tutk_source ? Bambu_success : open_tutk(t);
     if (t->url.scheme == Scheme::Local && !t->ssl) return -1;
@@ -2159,7 +2227,23 @@ OBN_EXPORT int Bambu_StartStreamEx(Bambu_Tunnel tunnel, int type)
     // CTRL_TYPE (0x3001) opens the PrinterFileSystem channel: keep TLS
     // :6000 open and forward CTRL JSON to printer firmware.
     if (type == kCtrlType) {
-        if (t->url.scheme == Scheme::Tutk && !fallback_to_lan(t)) return -1;
+        if (t->url.scheme == Scheme::Tutk) {
+            // The FTPS bridge talks to the printer's FTPS server, so
+            // force_ftps needs the LAN route.
+            if (ftps_bridge_enabled()) {
+                log_fmt(t->logger, t->log_ctx,
+                        "ctrl: force_ftps set, file browser goes over LAN");
+            } else if (t->tutk_ctrl || start_tutk_ctrl(t)) {
+                return Bambu_success;
+            }
+            if (!fallback_to_lan(t)) return -1;
+        }
+        // Bambu_Open skips the :6000 dial for lv=rtsps/rtsp URLs, which
+        // Studio also hands to the file browser.
+        if (t->url.scheme == Scheme::Local && !t->ssl &&
+            !dial_local_tls(t, "Bambu_StartStreamEx")) {
+            return -1;
+        }
         return start_native_ctrl_handshake(t);
     }
     return Bambu_StartStream(tunnel, true);
@@ -2240,7 +2324,13 @@ OBN_EXPORT int Bambu_ReadSample(Bambu_Tunnel tunnel, Bambu_Sample* sample)
     // it sees the terminal reply it's waiting on.
     if (t->ctrl_mode) {
         std::unique_lock<std::mutex> lk(t->ctrl_mu);
-        if (t->ctrl_out.empty()) return Bambu_would_block;
+        if (t->ctrl_out.empty()) {
+            if (t->tutk_ctrl && !t->tutk_ctrl->is_joined()) {
+                set_last_error("TUTK file-browser session lost");
+                return -1;
+            }
+            return Bambu_would_block;
+        }
         CtrlReply r = std::move(t->ctrl_out.front());
         t->ctrl_out.pop_front();
         lk.unlock();
@@ -2348,6 +2438,7 @@ OBN_EXPORT int Bambu_SendMessage(Bambu_Tunnel tunnel, int ctrl,
         set_last_error("CTRL channel not ready");
         return -1;
     }
+    if (t->tutk_ctrl) return send_tutk_ctrl(t, std::string(data, static_cast<std::size_t>(len)));
     CtrlRequest req;
     req.body.assign(data, static_cast<std::size_t>(len));
     {
