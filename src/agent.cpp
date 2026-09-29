@@ -1630,14 +1630,14 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
         OBN_WARN("camera_url(remote): no cloud token for dev=%s", dev_id.c_str());
         return {};
     }
-    // /user/ttcode answers 403 (code 8) unless X-BBL-Client-Name is
-    // "BambuStudio", X-BBL-OS-Type is present and the PoP pair is attached
-    // (research/06.06).
+    // POST /user/ttcode mints the TUTK uid. X-BBL-Client-Name/OS-Type are
+    // harmless here, but the PoP pair is fatal: bisected against production
+    // 2026-09-28, one header group per request - X-BBL only -> 200, X-BBL plus
+    // x-bbl-app-certification-id/x-bbl-device-security-sign -> 403 {"code":8},
+    // PoP alone -> 403, no X-BBL at all -> 200. So research/10.05's "PoP
+    // required" does not hold for this endpoint, and attaching a pair the
+    // server cannot verify costs the mint. Keep the header set that works.
     auto hdrs = obn::cloud::bbl_headers(session.access_token, session.user_id);
-    if (!obn::signing::add_pop_headers(hdrs)) {
-        OBN_WARN("camera_url(remote): no slicer cert/key; /user/ttcode needs PoP, not minting");
-        return {};
-    }
 
     const auto parsed = obn::camera::parse_packed_dev_key(dev_id);
     const std::string& serial = parsed.serial;
