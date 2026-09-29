@@ -629,6 +629,8 @@ private:
 
     void rescue_cloud_project_file(const std::string& dev_id,
                                    const std::string& json);
+    void rescue_cloud_liveview(const std::string& dev_id,
+                               const std::string& json);
 
     // Devices seen on the current cloud session (first report flips them in).
     // disconnect_cloud drains this set to release the RSA pubkeys learned
