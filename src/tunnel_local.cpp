@@ -1,6 +1,7 @@
 #include "obn/tunnel_local.hpp"
 
 #include "obn/json_lite.hpp"
+#include "obn/log.hpp"
 #include "obn/os_compat.hpp"
 #include "obn/tls_dial.hpp"
 
@@ -71,6 +72,21 @@ const char* ssl_fail_reason(SSL* ssl)
     }
     (void)ssl;
     return "SSL I/O error (no OpenSSL error queued)";
+}
+
+// TRACE dump of one outgoing frame. The login frame body carries the
+// access code and is never dumped.
+void trace_tx(std::uint32_t magic, std::uint32_t seq, const std::uint8_t* body,
+              std::size_t len)
+{
+    if (obn::log::threshold() > obn::log::LVL_TRACE) return;
+    if (magic == kMagicLoginClient) {
+        OBN_TRACE("tunnel_local tx magic=0x%08x seq=%u len=%zu (login, body not logged)",
+                  magic, seq, len);
+        return;
+    }
+    OBN_TRACE("tunnel_local tx magic=0x%08x seq=%u len=%zu: %s", magic, seq, len,
+              obn::log::hexdump(body, len, 256).c_str());
 }
 
 } // namespace
@@ -580,6 +596,7 @@ int Session::send_frame(SSL* ssl, std::uint32_t magic, const std::uint8_t* paylo
                         std::size_t payload_len, std::mutex* io_mu)
 {
     if (!ssl) return -1;
+    trace_tx(magic, seq_, payload, payload_len);
     const auto hdr = build_frame_header(static_cast<std::uint32_t>(payload_len),
                                         magic, seq_++);
     std::unique_lock<std::mutex> lk;
@@ -608,7 +625,16 @@ int Session::try_read_frames(SSL* ssl, std::mutex* io_mu)
         std::lock_guard<std::mutex> lk(recv_buf_mu_);
         recv_buf_.insert(recv_buf_.end(), chunk, chunk + n);
     }
+    rx_total_ += static_cast<std::size_t>(n);
+    OBN_TRACE("tunnel_local rx %d bytes: %s", n, obn::log::hexdump(chunk, n, 256).c_str());
     return 0;
+}
+
+std::string Session::handshake_note() const
+{
+    std::string s = "rx=" + std::to_string(rx_total_) + " bytes";
+    if (!hs_note_.empty()) s += ", last unexpected: " + hs_note_;
+    return s;
 }
 
 int Session::poll_incoming_wire(SSL* ssl, std::mutex* io_mu,
@@ -689,7 +715,21 @@ int Session::handshake_step(SSL* ssl, const Config& cfg, std::mutex* io_mu)
             phase_ = HandshakePhase::Failed;
             return -1;
         }
-        if (rr > 0 || !have_login_ack()) return 1;
+        if (rr > 0) return 1;
+        if (!have_login_ack()) {
+            FrameHeader hdr{};
+            if (parse_frame_header(recv_buf_.data(), recv_buf_.size(), &hdr) &&
+                hdr.magic != kMagicLoginServer) {
+                char b[64];
+                std::snprintf(b, sizeof(b), "frame magic=0x%08x len=%u: ",
+                              hdr.magic, hdr.payload_len);
+                hs_note_ = b + obn::log::hexdump(recv_buf_.data() + 16,
+                                                 recv_buf_.size() - 16);
+            } else if (!recv_buf_.empty() && recv_buf_.size() < 16) {
+                hs_note_ = "partial: " + obn::log::hexdump(recv_buf_.data(), recv_buf_.size());
+            }
+            return 1;
+        }
         std::vector<std::vector<std::uint8_t>> bodies;
         const std::size_t consumed =
             consume_frames(recv_buf_.data(), recv_buf_.size(), &bodies);
@@ -725,12 +765,12 @@ int Session::handshake_step(SSL* ssl, const Config& cfg, std::mutex* io_mu)
                     std::string(reinterpret_cast<const char*>(body.data()),
                                 body.size()),
                     &perr);
-                if (!v) continue;
-                if (v->find("mtype").as_int() == kMtypeCtrlSetup &&
+                if (v && v->find("mtype").as_int() == kMtypeCtrlSetup &&
                     v->find("result").as_int() == 0) {
                     phase_ = HandshakePhase::Ready;
                     return 0;
                 }
+                hs_note_ = "setup reply: " + obn::log::hexdump(body.data(), body.size(), 200);
             }
             const int rr = try_read_frames(ssl, io_mu);
             if (rr < 0) {
@@ -797,6 +837,7 @@ int Session::send_abi_json_with_binary_stream(SSL* ssl, const std::string& abi_j
         if (static_cast<std::size_t>(bin_in.gcount()) != bin_len) return -1;
     }
 
+    trace_tx(kMagicCtrlClient, seq_, body.data(), body.size());
     const auto hdr = build_frame_header(static_cast<std::uint32_t>(body.size()),
                                         kMagicCtrlClient, seq_++);
 
