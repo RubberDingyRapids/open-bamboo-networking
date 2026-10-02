@@ -2,6 +2,7 @@
 
 #include "obn/bambu_networking.hpp"
 #include "obn/config.hpp"
+#include "obn/err_table.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/os_compat.hpp"
@@ -404,6 +405,25 @@ int login_bind_session(const std::string&                           dev_ip,
                      rep.status.c_str(),
                      rep.ticket.c_str(),
                      obn::log::redact(rep.reason, 120).c_str());
+
+            // Phase 7 (ERR-01/HMS-01): decode this login_report's codes
+            // for obn.log. Log-only; the raw code always stays in the
+            // line, with (unknown) marking a lookup miss.
+            if (rep.has_err_code) {
+                const std::string msg =
+                    obn::err::describe_err_code(std::to_string(rep.err_code));
+                OBN_INFO("obn.decode bind_login_report err_code=%d -> %s",
+                         rep.err_code, msg.empty() ? "(unknown)" : msg.c_str());
+            }
+            for (const std::string& line :
+                 obn::err::scan_frame_codes(payload)) {
+                // reason.err_code already logged above when present.
+                if (rep.has_err_code &&
+                    line.rfind("err_code " + std::to_string(rep.err_code) +
+                                   " -> ", 0) == 0)
+                    continue;
+                OBN_INFO("obn.decode bind dev=%s", line.c_str());
+            }
 
             if (rep.status == "FAILURE") {
                 fail_info = rep.reason.empty() ? "login_report FAILURE"

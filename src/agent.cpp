@@ -19,7 +19,9 @@
 #include "obn/cloud_session.hpp"
 #include "obn/config.hpp"
 #include "obn/cover_cache.hpp"
+#include "obn/cover_key.hpp"
 #include "obn/cover_server.hpp"
+#include "obn/err_table.hpp"
 #include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
@@ -1378,7 +1380,7 @@ void Agent::rescue_cloud_project_file(const std::string& dev_id,
 
     // Build cleaned command: remove err_code, refresh sequence_id.
     print_obj.erase("err_code");
-    print_obj["sequence_id"] = obn::json::Value(obn::next_mqtt_seq_id());
+    print_obj["sequence_id"] = obn::seq_json_value(obn::next_mqtt_seq_id());
 
     // Reconstruct: {"print": {...}}
     obn::json::Object new_root;
@@ -1456,7 +1458,7 @@ void Agent::rescue_cloud_liveview(const std::string& dev_id,
              dev_id.c_str(), ttcode.c_str());
 
     lv_obj.erase("err_code");
-    lv_obj["sequence_id"] = obn::json::Value(obn::next_mqtt_seq_id());
+    lv_obj["sequence_id"] = obn::seq_json_value(obn::next_mqtt_seq_id());
 
     obn::json::Object new_root;
     new_root["liveview"] = obn::json::Value(std::move(lv_obj));
@@ -1769,7 +1771,7 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
     {
         obn::json::Object lv_obj;
         lv_obj["command"]     = obn::json::Value(std::string("prepare"));
-        lv_obj["sequence_id"] = obn::json::Value(obn::next_mqtt_seq_id());
+        lv_obj["sequence_id"] = obn::seq_json_value(obn::next_mqtt_seq_id());
         lv_obj["ttcode"]      = obn::json::Value(tt_resp.uid);
         lv_obj["authkey"]     = obn::json::Value(tt_resp.authkey);
         lv_obj["passwd"]      = obn::json::Value(tt_resp.passwd);
@@ -1962,8 +1964,15 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
             }
         }
         if (!host.empty()) {
+            // COVER-01: choose the LISTING-MATCH key — gcode_file basename
+            // when the frame carries it, subtask_name (MakerWorld profile
+            // title) when it doesn't. Identity is untouched: the gate, the
+            // synthetic_subtasks_ entry above and cover_server url_for all
+            // still key on subtask_name (research assumption A6).
+            const std::string model_key = obn::cover_model_key(patched);
             cover_cache::ensure(host, dev_id, user, pass,
-                                subtask_name, plate_idx, cover_version);
+                                subtask_name, model_key, plate_idx,
+                                cover_version);
         }
     }
 
@@ -1984,6 +1993,19 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
 
     // Suppress spurious 65543 (MQTT verification failure) from triggering Studio HMS banner
     filter_hms_code(patched, 65543);
+
+    // Phase 7 (HMS-01/ERR-01): decode err_code/HMS codes for obn.log.
+    // Log-only: scan_frame_codes takes the post-filter string read-only
+    // and every forwarded byte below stays exactly as today (the 65543
+    // filter above remains the only mutation). Emits nothing when the
+    // frame carries no codes.
+    {
+        const std::vector<std::string> decode_lines =
+            obn::err::scan_frame_codes(patched);
+        for (const std::string& line : decode_lines) {
+            OBN_INFO("obn.decode lan dev=%s %s", dev_id.c_str(), line.c_str());
+        }
+    }
 
     if (cb) cb(dev_id, patched);
 }
@@ -3025,6 +3047,19 @@ int Agent::connect_cloud()
 
         // Filter out spurious 65543 (MQTT verification failure caused by cloud prepare / project_file) from HMS
         filter_hms_code(json, 65543);
+
+        // Phase 7 (HMS-01/ERR-01): decode err_code/HMS codes for obn.log.
+        // Log-only: scan_frame_codes is read-only over the post-filter
+        // string; every forwarded byte downstream stays exactly as today.
+        // Emits nothing when the frame carries no codes.
+        {
+            const std::vector<std::string> decode_lines =
+                obn::err::scan_frame_codes(json);
+            for (const std::string& line : decode_lines) {
+                OBN_INFO("obn.decode cloud dev=%s %s", dev_id.c_str(),
+                         line.c_str());
+            }
+        }
 
         // Mirror Bambu's plugin: the FIRST cloud report we receive
         // for a device kicks off an on_printer_connected("tunnel/<id>")
