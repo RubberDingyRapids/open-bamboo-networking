@@ -378,6 +378,7 @@ add_library(bambu_networking SHARED
     src/abi_ft.cpp
     src/agent.cpp
     src/auth.cpp
+    src/camera_probe.cpp
     src/camera_url.cpp
     src/cert_store.cpp
     src/config.cpp
@@ -390,7 +391,10 @@ add_library(bambu_networking SHARED
     src/cloud_session.cpp
     ${OBN_CLOUD_CA_SOURCES}
     src/cover_cache.cpp
+    src/cover_key.cpp
     src/cover_server.cpp
+    src/err_table.cpp
+    src/err_table_data.cpp
     src/ftps.cpp
     src/http_client.cpp
     src/json_lite.cpp
@@ -792,6 +796,16 @@ if(OBN_BUILD_TESTS)
     set_tests_properties(push_status_merge PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 
+    # Phase 7 (ERR-01/HMS-01): err_code/HMS decode tables + lookups.
+    # src/json_lite.cpp is the parse substrate for scan_frame_codes;
+    # src/err_table_data.cpp is the generated MIT-adopted table data.
+    add_executable(err_table_test tests/err_table_test.cpp
+        src/err_table.cpp
+        src/err_table_data.cpp
+        src/json_lite.cpp)
+    target_include_directories(err_table_test PRIVATE include)
+    add_test(NAME err_table COMMAND err_table_test)
+
     # Hermetic unit tests for obn::signing — exercises key loading, canonical
     # JSON ordering, signature round-trip and envelope structure validation.
     # Generates ephemeral RSA keys at runtime; no on-disk secrets required.
@@ -811,6 +825,24 @@ if(OBN_BUILD_TESTS)
         target_link_libraries(signing_test PRIVATE ws2_32)
     endif()
     add_test(NAME signing COMMAND signing_test)
+
+    # ensure_block_cloud_off() + the obn_ensure_conf_block_cloud() export the
+    # plugin installer delegates obn.conf writes to (OrcaSlicer's audit denies
+    # every Python open() of a "*.conf" path). Unlike config_test below this
+    # one must also build on Windows -- that is the platform with the audit
+    # hook. Same source set as config_test plus the Winsock pairing log.cpp
+    # needs there.
+    add_executable(conf_ensure_test tests/conf_ensure_test.cpp
+        src/config.cpp
+        src/lan_tls.cpp
+        src/log.cpp
+        src/os_compat.cpp)
+    target_include_directories(conf_ensure_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_link_libraries(conf_ensure_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    if(WIN32)
+        target_link_libraries(conf_ensure_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME conf_ensure COMMAND conf_ensure_test)
 
     # DOC-01 golden-fixture suite for the SSDP parser. Catch2 comes in via
     # FetchContent pinned to a fixed release tag (checkpoint OQ-1 route b2):
@@ -847,6 +879,52 @@ if(OBN_BUILD_TESTS)
     add_test(NAME ssdp_listener COMMAND ssdp_listener_test)
     set_tests_properties(ssdp_listener PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+
+    # Phase 8 (CAM-01): concurrent :6000/:322 probe behind an injectable
+    # probe primitive. camera_probe.cpp carries no I/O of its own (the
+    # injected primitive does), so the link surface stays camera_probe +
+    # camera_url + json_lite — no transport, no new dependencies.
+    add_executable(camera_probe_test tests/camera_probe_test.cpp
+        src/camera_probe.cpp
+        src/camera_url.cpp
+        src/json_lite.cpp)
+    target_include_directories(camera_probe_test PRIVATE include)
+    add_test(NAME camera_probe COMMAND camera_probe_test)
+
+    # Phase 8 (COVER-01): pure primary/fallback cover listing key.
+    # cover_key.cpp is JSON string logic only (no transport, no agent,
+    # no I/O), so the link surface stays cover_key + json_lite — no new
+    # dependencies; json_lite is the parse substrate, same as
+    # push_status_merge above.
+    add_executable(cover_key_test tests/cover_key_test.cpp
+        src/cover_key.cpp
+        src/json_lite.cpp)
+    target_include_directories(cover_key_test PRIVATE include)
+    add_test(NAME cover_key COMMAND cover_key_test)
+
+    # Phase 9 (EXP-01): opt-in exp_numeric_sequence_id flag — flag-off must be
+    # the byte-identical legacy string form, flag-on the bare JSON number, on
+    # exactly the four self-built signed-frame sites. Real src/config.cpp links
+    # (NOT tests/config_stub.cpp) so the actual obn.conf parse path is
+    # exercised; src/signing.cpp is in the link set for the maybe_sign
+    # round-trip case. Inline helpers only — every other test link set is
+    # unchanged.
+    add_executable(exp_seq_test tests/exp_seq_test.cpp
+        src/config.cpp
+        src/lan_tls.cpp
+        src/log.cpp
+        src/os_compat.cpp
+        src/json_lite.cpp
+        src/signing.cpp)
+    target_include_directories(exp_seq_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(exp_seq_test PRIVATE
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX})
+    target_link_libraries(exp_seq_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    if(WIN32)
+        target_link_libraries(exp_seq_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME exp_seq COMMAND exp_seq_test)
 endif()
 if(OBN_BUILD_TESTS AND NOT WIN32)
 
