@@ -75,6 +75,23 @@ bool lan_camera_reachable(const std::string& lan_url)
     return ok;
 }
 
+// Cloud-paired printers never publish ipcam.rtsp_url to us, so the latched
+// lv from harvest_media_caps stays empty on first use. X1/P1S/P2S/H serve
+// RTSPS on :322 while A1/P1/P1P serve MJPEG on :6000 (research/09.03); with
+// no hint BambuSource defaults to MJPEG and an RTSP printer shows no video.
+// A short probe of :322 picks the right hint; when :322 is closed the URL is
+// left untouched so MJPEG printers keep working. Runs only on the offload /
+// BambuSource threads, never on Studio's UI thread.
+std::string append_lv_hint(const std::string& lan_url)
+{
+    obn::camera::LocalCameraUrl u;
+    if (!obn::camera::parse_local_camera_url(lan_url, u)) return lan_url;
+    if (!u.lv.empty()) return lan_url;
+    if (!tcp_open(u.ip, 322, 400)) return lan_url;
+    OBN_INFO("camera probe: port 322 open on %s -> lv=rtsps", u.ip.c_str());
+    return lan_url + "&lv=rtsps";
+}
+
 void deliver_camera_url(const std::function<void(std::string)>& callback,
                         const std::string& serial, std::string url,
                         const char* kind)
@@ -137,8 +154,10 @@ OBN_ABI int bambu_network_get_camera_url(void* agent,
     // Cloud URL minting is an HTTP POST (and prefer_lan_over_tutk may probe
     // LAN).
     // Offload so Studio's UI / MediaPlayCtrl thread returns immediately.
-    auto work = [a, dev_id, serial, lan_url, callback, cloud_usable,
+    auto work = [a, dev_id, serial, lan_url_raw = lan_url, callback,
+                 cloud_usable,
                  prefer_lan = prefer_lan && !lan_video_off]() {
+        const std::string lan_url = append_lv_hint(lan_url_raw);
         if (!lan_url.empty() && prefer_lan) {
             if (lan_camera_reachable(lan_url)) {
                 deliver_camera_url(callback, serial, lan_url, "LAN URL (prefer_lan_over_tutk)");
@@ -258,7 +277,7 @@ OBN_ABI const char* obn_get_lan_camera_url(const char* dev_id)
     auto* a = obn::Agent::active_instance();
     if (!a) return nullptr;
 
-    s_last_url = a->camera_url_for(dev_id);
+    s_last_url = append_lv_hint(a->camera_url_for(dev_id));
     if (s_last_url.empty()) {
         OBN_WARN("obn_get_lan_camera_url: no LAN route for dev=%s", dev_id);
         return nullptr;

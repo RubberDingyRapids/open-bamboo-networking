@@ -24,6 +24,10 @@ void registry_set_peer_cert(const std::string& ip, const std::string& path);
 
 std::string registry_ca_file();
 std::optional<std::string> registry_lookup_serial(const std::string& ip);
+// Reverse of registry_lookup_serial: first IP persisted for `serial` in the
+// hydrated registry (obn.env), empty when unknown. Lets a fresh process mint
+// a LAN camera URL before the next SSDP NOTIFY arrives.
+std::string registry_ip_for_serial(const std::string& serial);
 
 // Load printer.cer (+ optional peer leaf), enable VERIFY_PEER + PARTIAL_CHAIN.
 bool configure_lan_ssl_verify(SSL_CTX*           ctx,

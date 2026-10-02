@@ -925,6 +925,22 @@ if(OBN_BUILD_TESTS)
         target_link_libraries(exp_seq_test PRIVATE ws2_32)
     endif()
     add_test(NAME exp_seq COMMAND exp_seq_test)
+
+    # LAN env registry hydration: obn.env carries the ip<->serial / ip<->peer
+    # pairs that let a fresh process mint a LAN camera URL before the next
+    # SSDP NOTIFY, and write_state_file_locked must not erase them from an
+    # empty map. Real src/lan_tls.cpp + src/config.cpp (config_test pattern).
+    add_executable(lan_env_registry_test tests/lan_env_registry_test.cpp
+        src/config.cpp
+        src/lan_tls.cpp
+        src/log.cpp
+        src/os_compat.cpp)
+    target_include_directories(lan_env_registry_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_link_libraries(lan_env_registry_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    if(WIN32)
+        target_link_libraries(lan_env_registry_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME lan_env_registry COMMAND lan_env_registry_test)
 endif()
 if(OBN_BUILD_TESTS AND NOT WIN32)
 

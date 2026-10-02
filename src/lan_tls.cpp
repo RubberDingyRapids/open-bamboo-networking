@@ -159,16 +159,43 @@ void restrict_user_readwrite(const std::filesystem::path& path)
 }
 #endif
 
+// Reverse of env_key_for_ip: "OBN_LAN_TLS_IP_192_168_2_110" -> "192.168.2.110".
+// Only digits and separators are accepted so unrelated OBN_LAN_TLS_* keys can
+// never be misread as an address.
+std::optional<std::string> ip_from_state_key(const std::string& key,
+                                             const char*        prefix)
+{
+    const std::size_t plen = std::strlen(prefix);
+    if (key.size() <= plen || key.compare(0, plen, prefix) != 0)
+        return std::nullopt;
+    std::string ip = key.substr(plen);
+    int         dots = 0;
+    for (char& c : ip) {
+        if (c == '_') { c = '.'; ++dots; }
+        else if (c < '0' || c > '9') return std::nullopt;
+    }
+    if (dots != 3) return std::nullopt;
+    return ip;
+}
+
 void hydrate_env_from_state_file_once()
 {
     // Log outside call_once: in libBambuSource the log threshold itself
     // reads OBN_* env through env_var_get and would re-enter this once.
+    // Every public entry that takes g_mu must call this BEFORE locking: the
+    // once body below locks g_mu to merge the persisted ip<->serial pairs.
     static std::once_flag once;
     static std::string    hydrated_from;
     bool                  first = false;
     std::call_once(once, [&first]() {
         first = true;
-        for (const auto& path : state_file_search_paths()) {
+        const auto paths = state_file_search_paths();
+        // Merging under g_mu keeps the maps consistent with concurrent
+        // registry_put_ip_serial / registry_set_peer_cert callers. Nothing
+        // inside this body calls back into env_var_get (which would re-enter
+        // call_once), and apply_state_line uses env_var_get_os directly.
+        std::lock_guard<std::mutex> g_lk(g_mu);
+        for (const auto& path : paths) {
             std::error_code ec;
             if (!std::filesystem::is_regular_file(path, ec)) continue;
             std::ifstream in(path);
@@ -176,6 +203,20 @@ void hydrate_env_from_state_file_once()
             std::string line;
             while (std::getline(in, line)) {
                 (void)apply_state_line(line);
+                // apply_state_line only mirrors the ip<->serial / ip<->peer
+                // pairs into env; the maps drive registry_lookup_serial and
+                // registry_ip_for_serial. Without this merge the first
+                // write_state_file_locked in a fresh process (empty map)
+                // would erase the pairs from obn.env.
+                const auto eq = line.find('=');
+                if (eq == std::string::npos || eq == 0) continue;
+                const std::string key = line.substr(0, eq);
+                const std::string val = line.substr(eq + 1);
+                if (val.empty()) continue;
+                if (auto ip = ip_from_state_key(key, kEnvIpPrefix))
+                    g_ip_to_serial.emplace(*ip, val);
+                else if (auto pip = ip_from_state_key(key, kEnvPeerPrefix))
+                    g_ip_to_peer_cert.emplace(*pip, val);
             }
             hydrated_from = path.string();
             return;
@@ -310,6 +351,10 @@ bool verify_enabled()
 
 void registry_set_config_dir(const std::string& dir)
 {
+    // Before locking: sync_registry_locked below rewrites obn.env from the
+    // in-memory maps, so the persisted pairs must be merged in first or a
+    // fresh process would erase them.
+    hydrate_env_from_state_file_once();
     std::lock_guard<std::mutex> lk(g_mu);
     if (g_config_dir == dir) return;
     g_config_dir = dir;
@@ -322,6 +367,7 @@ void registry_set_config_dir(const std::string& dir)
 
 void registry_set_ca_file(const std::string& path)
 {
+    hydrate_env_from_state_file_once();
     std::lock_guard<std::mutex> lk(g_mu);
     if (g_ca_file == path) return;
     g_ca_file = path;
@@ -337,6 +383,7 @@ void registry_set_ca_file(const std::string& path)
 void registry_put_ip_serial(const std::string& ip, const std::string& serial)
 {
     if (ip.empty() || serial.empty()) return;
+    hydrate_env_from_state_file_once();
     std::lock_guard<std::mutex> lk(g_mu);
     const auto it = g_ip_to_serial.find(ip);
     if (it != g_ip_to_serial.end() && it->second == serial) return;
@@ -349,6 +396,7 @@ void registry_put_ip_serial(const std::string& ip, const std::string& serial)
 void registry_set_peer_cert(const std::string& ip, const std::string& path)
 {
     if (ip.empty()) return;
+    hydrate_env_from_state_file_once();
     std::lock_guard<std::mutex> lk(g_mu);
     if (path.empty()) {
         if (g_ip_to_peer_cert.erase(ip) == 0) return;
@@ -441,10 +489,21 @@ std::string registry_ca_file()
 
 std::optional<std::string> registry_lookup_serial(const std::string& ip)
 {
+    hydrate_env_from_state_file_once();
     std::lock_guard<std::mutex> lk(g_mu);
     auto it = g_ip_to_serial.find(ip);
     if (it == g_ip_to_serial.end()) return std::nullopt;
     return it->second;
+}
+
+std::string registry_ip_for_serial(const std::string& serial)
+{
+    if (serial.empty()) return {};
+    hydrate_env_from_state_file_once();
+    std::lock_guard<std::mutex> lk(g_mu);
+    for (const auto& [ip, s] : g_ip_to_serial)
+        if (s == serial) return ip;
+    return {};
 }
 
 const char* resolve_lan_ca_file()
@@ -461,6 +520,7 @@ void propagate_cross_so_env(const obn::config::Settings& cfg)
 {
     // libBambuSource has its own config.cpp; mirror flags into obn.env
     // (primary IPC on Windows) and process env (best-effort within this load).
+    hydrate_env_from_state_file_once();
     std::lock_guard<std::mutex> lk(g_mu);
     g_force_ftps              = cfg.force_ftps;
     g_lan_tls_skip_verify     = cfg.lan_tls_skip_verify;

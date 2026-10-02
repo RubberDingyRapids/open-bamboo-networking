@@ -1669,6 +1669,25 @@ std::string Agent::camera_url_for(const std::string& dev_id)
             it != lan_lv_proto_by_dev_.end())
             lv = it->second;
     }
+    if (ip.empty()) {
+        // Fresh process: SSDP NOTIFYs are periodic (observed ~10 s) but not
+        // guaranteed before the first camera open, so a fresh agent may know
+        // the serial and access code yet still have no address. The
+        // ip<->serial pair persisted in obn.env (lan_tls registry) survives
+        // restarts; restoring it also publishes the cert pin and kicks the
+        // LAN session autostart via note_device_lan_ip.
+        if (const std::string seeded =
+                obn::lan_tls::registry_ip_for_serial(dev_id);
+            !seeded.empty()) {
+            OBN_INFO("camera_url: dev=%s LAN ip restored from registry: %s",
+                     dev_id.c_str(), seeded.c_str());
+            note_device_lan_ip(dev_id, seeded);
+            std::lock_guard<std::mutex> lk(mu_);
+            if (auto it = lan_ip_by_dev_.find(dev_id);
+                it != lan_ip_by_dev_.end())
+                ip = it->second;
+        }
+    }
     if (ip.empty() || code.empty()) {
         OBN_DEBUG("camera_url: no LAN route for dev=%s (ip=%s code=%s)",
                   dev_id.c_str(), ip.empty() ? "unknown" : ip.c_str(),
