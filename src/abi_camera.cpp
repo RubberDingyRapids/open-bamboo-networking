@@ -1,3 +1,4 @@
+#include <chrono>
 #include <functional>
 #include <string>
 #include <system_error>
@@ -7,6 +8,7 @@
 #include "obn/abi_export.hpp"
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
+#include "obn/camera_probe.hpp"
 #include "obn/camera_url.hpp"
 #include "obn/config.hpp"
 #include "obn/lan_tls.hpp"
@@ -51,8 +53,26 @@ bool lan_camera_reachable(const std::string& lan_url)
     obn::camera::LocalCameraUrl u;
     if (!obn::camera::parse_local_camera_url(lan_url, u)) return false;
     constexpr int kTimeoutMs = 400;
-    return tcp_open(u.ip, u.video_port > 0 ? u.video_port : u.ctrl_port,
-                    kTimeoutMs);
+    // Concurrent two-port gather (CAM-01): :6000 CTRL and the RTSP(S)
+    // video port dial in parallel behind the injected tcp_open primitive;
+    // either port answering keeps the URL reachable (OQ3). This whole
+    // function still runs only on the detached offload thread below.
+    const auto t0 = std::chrono::steady_clock::now();
+    const obn::camera_probe::Result probe = obn::camera_probe::probe_both(
+        u.ip, u.ctrl_port, u.video_port, kTimeoutMs, tcp_open);
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count();
+    const bool ok = obn::camera_probe::reachable(probe);
+    // Field-visible probe timing (ftps.cpp:229-235 precedent). The default
+    // log level is info, so this line lands in obn.log; it is emitted here
+    // on the existing offload path, never on Studio's calling thread.
+    OBN_INFO("camera probe host=%s ctrl=%d video=%d reachable=%d "
+             "elapsed_ms=%lld",
+             u.ip.c_str(), probe.ctrl ? 1 : 0, probe.video ? 1 : 0,
+             ok ? 1 : 0, static_cast<long long>(elapsed_ms));
+    return ok;
 }
 
 void deliver_camera_url(const std::function<void(std::string)>& callback,
