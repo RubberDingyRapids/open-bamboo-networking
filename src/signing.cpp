@@ -339,9 +339,11 @@ static std::string json_str_escape(const std::string& s)
     return out;
 }
 
-// Emits {"header":…,"<root_key>":dump} ONLY — trailing siblings in the input
-// payload are not carried. See the invariant comment at to_sign (maybe_sign)
-// below, locked by test_trailing_sibling_reconstruction in tests/signing_test.cpp.
+// Emits {"header":…,"<root_key>":<body>} where <body> is the envelope-minus-
+// header INCLUDING any trailing top-level siblings (the caller passes the same
+// `body` string it signed — one string feeds both). See the invariant comment
+// at to_sign (maybe_sign) below, locked by test_trailing_sibling_reconstruction
+// in tests/signing_test.cpp.
 // Builds the complete signed envelope JSON string.
 std::string build_envelope(const std::string& to_sign,
                            const std::string& sig_b64,
@@ -391,22 +393,44 @@ std::string maybe_sign(const std::string& payload_json, EVP_PKEY* device_pub,
         build_command_dump(root_key, payload_json, device_pub, developer_mode);
     if (dump.empty()) return payload_json; // malformed; pass through
 
-    // SINGLE-ROOT WRAPPER INVARIANT (locked by test_trailing_sibling_reconstruction
-    // in tests/signing_test.cpp): to_sign is exactly {"<root_key>":<dump>} —
-    // family key first, single root, never sorted at the root level; `dump` here
-    // is byte-identical to the dump build_envelope emits (it receives the same
-    // string), so payload_len == bytes signed == wire bytes.
-    // A payload with trailing siblings (e.g. {"print":…,"user_id":…}) currently
-    // DROPS the sibling — pinned, not fixed (research/10.04 §Signing consensus;
-    // diverges from the #72/farm consensus, which signs envelope-minus-header
-    // including user_id).
-    const std::string to_sign = "{\"" + root_key + "\":" + dump + "}";
+    // Trailing siblings (e.g. "user_id" after the root) are part of the signed
+    // envelope-minus-header per the farm consensus (research/10.04 §Signing
+    // consensus). Re-emit every other top-level entry AFTER the root (family
+    // key first; the remaining top-level keys follow in json_lite map
+    // (lexicographic) order). Zero siblings -> empty string -> byte-exact
+    // legacy wire.
+    std::string siblings;
+    {
+        auto root_val = obn::json::parse(payload_json); // parse succeeded above
+        if (root_val && root_val->is_object()) {
+            for (const auto& kv : root_val->as_object()) {
+                if (kv.first == root_key) continue;
+                siblings += ',';
+                siblings += obn::json::Value(kv.first).dump(); // quoted+escaped key
+                siblings += ':';
+                siblings += kv.second.dump();
+            }
+        }
+    }
+    const std::string body = dump + siblings; // envelope-minus-header
+
+    // SINGLE-BODY INVARIANT (locked by test_trailing_sibling_reconstruction in
+    // tests/signing_test.cpp): to_sign is exactly {"<root_key>":<body>} — the
+    // wire envelope with the header removed, trailing siblings included.
+    // ONE `body` string feeds both to_sign and build_envelope, so payload_len
+    // == bytes signed == wire bytes. Sibling order is specified and stable:
+    // the root key comes first regardless of alphabet, then the remaining
+    // top-level keys in json_lite map (lexicographic) order — byte-identical
+    // between the signed string and the wire envelope because both derive from
+    // the single body string. Zero siblings collapse to the exact legacy
+    // concatenation, so sibling-less payloads stay byte-exact.
+    const std::string to_sign = "{\"" + root_key + "\":" + body + "}";
 
     const std::string sig_b64 = rsa_sha256_sign_b64(
         pkey,
         reinterpret_cast<const unsigned char*>(to_sign.data()), to_sign.size());
 
-    return build_envelope(to_sign, sig_b64, root_key, dump);
+    return build_envelope(to_sign, sig_b64, root_key, body);
 }
 
 std::string sign_bytes(const std::string& data)

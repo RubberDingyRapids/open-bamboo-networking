@@ -543,13 +543,9 @@ namespace obn::config {
 
 static int test_trailing_sibling_reconstruction()
 {
-    // SIGN-01 / D-08: trailing sibling AFTER the root key.
-    // PINNED OBSERVED BEHAVIOR: maybe_sign/build_envelope emit
-    // {"header":…,"print":<dump>} only — the trailing sibling (user_id) is
-    // silently dropped, which DIVERGES from the #72/farm consensus ("signature
-    // covers the whole envelope minus header, including user_id"), annotated
-    // in research/10.04 §Signing consensus. Pinned per the Phase 2 D-09
-    // register and NOT fixed (PROJECT.md Out of Scope: no signing change).
+    // SIGN-03: trailing sibling AFTER the root key is now SIGNED and EMITTED —
+    // to_sign == envelope-minus-header including user_id (farm consensus,
+    // research/10.04 §Signing consensus). Replaces the earlier drop-pin.
     const std::string payload =
         R"({"print":{"command":"pause","sequence_id":"11"},"user_id":"u_42"})";
     const std::string env = obn::signing::maybe_sign(payload); // no device key → hermetic
@@ -557,23 +553,22 @@ static int test_trailing_sibling_reconstruction()
     auto val = obn::json::parse(env);
     CHECK(val);
 
-    // (D-08.1) Byte-exact wire match: reconstruct the signed string FROM THE
-    // EMITTED envelope — the wire bytes are the oracle, not the input bytes.
-    std::string dump    = val->find("print").dump();
-    std::string to_sign = "{\"print\":" + dump + "}";
+    // (1) Byte-exact wire match via the FIRMWARE reconstruction rule
+    // ("{" + everything from the "print" key to the final '}' — 10.04):
+    std::size_t kpos = env.find("\"print\":");
+    CHECK(kpos != std::string::npos);
+    std::string to_sign = "{" + env.substr(kpos);   // root + trailing sibling
     double plen = val->find("header.payload_len").as_number();
     CHECK(static_cast<std::size_t>(plen) == to_sign.size());
-    // Envelope must end with the literal tail: ,"print":<dump>}
-    std::string tail = ",\"print\":" + dump + "}";
-    CHECK(env.size() >= tail.size());
-    CHECK(env.compare(env.size() - tail.size(), tail.size(), tail) == 0);
 
-    // (D-08.2) Signature round-trip against the wire-reconstructed signed string.
+    // (2) Signature round-trip against that reconstruction.
     CHECK(verify_b64_sig(to_sign, val->find("header.sign_string").as_string()));
 
-    // (D-08.3) Sibling pin: dropped trailing sibling is the observed outcome.
-    CHECK(val->find("user_id").kind() == obn::json::Value::Kind::Null);
-    CHECK(env.find("\"user_id\"") == std::string::npos);
+    // (3) Sibling PRESENT at the envelope top level, outside `print`.
+    CHECK(val->find("user_id").kind() == obn::json::Value::Kind::String);
+    CHECK(val->find("user_id").as_string() == "u_42");
+    CHECK(env.find("\"user_id\"") != std::string::npos);
+    CHECK(val->find("print.user_id").kind() == obn::json::Value::Kind::Null);
     return 0;
 }
 
