@@ -2392,6 +2392,23 @@ void Agent::set_user_selected_machine(std::string dev_id)
     // Persist outside mu_: this runs on the slicer's UI thread, and mu_ also
     // guards the LAN/cloud bookkeeping the session threads need.
     if (store) store->remember_machine(selected);
+    // Studio zeroes MachineObject's push counters on every selection change
+    // (DeviceManager::set_selected_machine -> reset()) and gates the AMS panel
+    // and camera play button on is_info_ready(), which needs a fresh msg=0
+    // full push. kickstart_cloud_status latches per device per CONNACK, so a
+    // mid-session re-selection would otherwise wait for the printer's next
+    // spontaneous full push - observed as ~14 s of dead AMS/play UI after a
+    // selection churn. Re-arm the latch for the newly selected device and ask
+    // for a snapshot now. Duplicate pushalls are harmless (the printer just
+    // answers with another full state); CloudSession's own guards cover the
+    // not-yet-subscribed window that the latch exists to protect.
+    if (!selected.empty()) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            cloud_kickstarted_devs_.erase(selected);
+        }
+        kickstart_cloud_status();
+    }
     // The user switched active printer: bring LAN up for the newly selected one
     // if its IP + access code are already known. connect_printer() inside
     // ensure_lan_session tears down any LanSession that targeted the previous
