@@ -164,6 +164,26 @@ patch_mqtt_ipcam_file = 0
 patch_mqtt_internal_storage = 0
 
 
+# --- EXPERIMENT: numeric sequence_id (opt-in) -------------------------
+#
+# !!! EXPERIMENTAL opt-in — leave this at 0 for normal use. !!!
+#
+# The key is `exp_numeric_sequence_id` (default 0).
+#
+# 0: the plugin emits `sequence_id` as a JSON string on the frames it
+#   builds AND signs itself — the `project_file` print command and the
+#   liveview prepare / rescue re-publishes — which is byte-identical to
+#   stock behaviour.
+# 1: the same value is emitted as a JSON number on exactly those frames,
+#   for the numeric-`sequence_id` investigation documented in
+#   research/06.02-mqtt.md.
+#
+# Nothing else changes: security.* frames, the pushall constant and
+# Studio-authored frames keep their existing form.
+
+exp_numeric_sequence_id = 0
+
+
 # --- Cloud ----------------------------------------------------------
 #
 # Everything below talks to Bambu Lab's online services (login, status,

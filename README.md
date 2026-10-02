@@ -486,6 +486,12 @@ Spaces around `=` are optional.
 | `patch_mqtt_ipcam_file` | `0` | Inject `ipcam.file` block into push_status when firmware omits it. Without this, Studio may refuse to open the file browser on some models. |
 | `patch_mqtt_internal_storage` | `0` | Set the internal storage capability bit so Studio shows the eMMC tab in the file browser. Firmware often omits this bit even when :6000/FTPS lists eMMC, and browsing internal memory may still be slow or unreliable (e.g. on P2S). |
 
+**Experiments** (all off by default; experimental — leave at `0` unless you are investigating the behaviour in question):
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `exp_numeric_sequence_id` | `0` | Emit `sequence_id` as a JSON number instead of the string form on the signed frames the plugin builds itself (the `project_file` print command, the liveview prepare and the rescue re-publishes) — experimental, for the open numeric-`sequence_id` question in `research/06.02-mqtt.md`; leaving it at `0` keeps stock behaviour. Nothing else changes: `security.*` frames, the pushall constant and Studio-authored frames keep their form. |
+
 **Cloud endpoints** (change only for CN accounts or a dev host):
 
 | Key | Default | Effect |

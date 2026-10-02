@@ -340,7 +340,7 @@ std::string build_project_file_json_impl(const BBL::PrintParams& p,
 
     std::ostringstream os;
     os << "{\"print\":{";
-    os << "\"sequence_id\":" << json_escape(obn::next_mqtt_seq_id());
+    os << "\"sequence_id\":" << obn::seq_json_literal(obn::next_mqtt_seq_id());
     os << ",\"command\":\"project_file\"";
     os << param_field;
     os << ",\"project_id\":" << json_escape(opts.project_id);
