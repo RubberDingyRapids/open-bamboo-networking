@@ -12,6 +12,7 @@ How a client talks to a Bambu printer (and when it talks to Bambu’s cloud inst
 | 6.4 Port 6000 | [06.04-port-6000.md](06.04-port-6000.md) |
 | 6.5 RTSP / RTSPS | [06.05-rtsp.md](06.05-rtsp.md) |
 | 6.6 Cloud REST API | [06.06-cloud-rest.md](06.06-cloud-rest.md) |
+| 6.7 Farm mode | [06.07-farm.md](06.07-farm.md) |
 
 ### Channel list
 
@@ -24,6 +25,7 @@ How a client talks to a Bambu printer (and when it talks to Bambu’s cloud inst
 | **TCP :6000** | bidirectional | CTRL file browser, `ft_*` model cache, MJPEG on some models; TUTK relay off-LAN | [§6.4](06.04-port-6000.md) |
 | **RTSP(S)** | printer → client | H.264 live view on RTSP-capable models | [§6.5](06.05-rtsp.md) |
 | **Cloud REST** | client ↔ Bambu API | Account, device list, access codes, cloud print, certs — **not** TCP to the printer IP | [§6.6](06.06-cloud-rest.md) |
+| **Farm mode** | printer ↔ farm server | Farm management plane: mutual-TLS MQTT `:1883` (printer dials out) + dual HTTP+TLS REST `:8888` (INTERESTING_REPOS.md:22) | [§6.7](06.07-farm.md) |
 
 Also noted under MQTT / :6000: plaintext MQTT **:1883** on some firmware; **MJPEG** live view on `:6000` for A1/P1-class (different handshake from CTRL). Printer HTTP `/info` is **not** used by stock `bind_detect` (that path is TCP `:3000` `login/detect`).
 
