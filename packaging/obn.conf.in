@@ -192,13 +192,17 @@ exp_numeric_sequence_id = 0
 #
 # !!! WARNING !!!
 #
-# Full cloud operation with a secured printer also REQUIRES you to
-# supply your own slicer_cert_pem, slicer_key_pem, and slicer_crl_pem
-# (see below). The MQTT/HTTP cert_id is derived from the leaf of
-# slicer_cert.pem. These are private credentials; this project does not
-# distribute them. You must obtain them yourself, and you alone are
-# responsible for ensuring that your use of them complies with
-# applicable terms and law.
+# Full cloud operation with a secured printer needs the slicer
+# certificate material (slicer_cert_pem / slicer_key_pem /
+# slicer_crl_pem; see below). The MQTT/HTTP cert_id is derived from
+# the leaf of slicer_cert.pem. Since v0.2.24 the plugin fetches this
+# material itself via bambu_network_update_cert - the same endpoint
+# Bambu's own plugin uses - and refreshes it whenever Bambu rotates
+# the certificate; set the paths below only to override it with your
+# own copies. The embedded bootstrap values the automatic fetch needs
+# and their recovery procedure are documented in src/appcert_cipher.cpp.
+# You alone are responsible for ensuring that your use of this
+# material complies with applicable terms and law.
 
 # Fully blocks talking to Bambu's cloud (live status, subscriptions,
 # cloud printing / uploading print files), except login, syncing

@@ -72,13 +72,16 @@ std::string base64_encode(const unsigned char* data, std::size_t len);
 // Derived from the leaf of slicer_cert.pem:
 //   lowercase_hex(serial) + issuer_RFC2253  (no separator).
 // Returns empty string when the cert is absent or unparseable.
-const std::string& slicer_cert_id();
+// Re-derived after invalidate_cache(), so a credential refresh is picked up
+// by the next envelope. Returned BY VALUE (the cached ids can be replaced
+// concurrently by the app-cert fetch).
+std::string slicer_cert_id();
 
 // Returns the value for the HTTP `x-bbl-app-certification-id` header used on
 // secured-printer REST writes (e.g. POST /my/task). DIFFERENT serialization
 // from slicer_cert_id(): `issuer_RFC2253 + ":" + serial.lower()`, from the
 // same leaf. Returns "" when the cert is absent or unparseable.
-const std::string& app_certification_id();
+std::string app_certification_id();
 
 // PEM chain of the slicer (app) certificate matching slicer_key.pem, read
 // from config_dir/slicer_cert.pem (or obn.conf slicer_cert_pem). Source of
@@ -98,8 +101,21 @@ std::string slicer_crl_pem();
 bool slicer_app_cert_usable();
 
 // True when a slicer private key (slicer_key.pem or obn.conf slicer_key_pem)
-// is loaded, i.e. maybe_sign() can actually produce a signature. Cheap: the
-// key is parsed once and cached.
+// is loaded, i.e. maybe_sign() can actually produce a signature. The key is
+// parsed once and cached; the cache survives until invalidate_cache().
 bool slicer_signing_key_present();
+
+// True when payload_json carries a signable root (top-level "print" or a
+// prepare "liveview"), regardless of whether a slicer key is currently
+// loaded. Lets callers spot "signable but unsigned" and kick the app-cert
+// fetch instead of publishing a payload the printer will reject.
+bool needs_signing_key(const std::string& payload_json);
+
+// Drops the cached parsed key and cert-derived ids so the next call
+// re-reads config_dir material. Called by the app-cert fetch after it
+// writes refreshed credentials. Concurrent maybe_sign/device_security_sign
+// calls holding the retired EVP_PKEY stay valid: the replaced key object is
+// kept alive until process exit instead of being freed underneath them.
+void invalidate_cache();
 
 } // namespace obn::signing

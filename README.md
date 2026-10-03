@@ -214,22 +214,27 @@ file browsing, file transfer, camera) work normally.
 ### Option B: cloud mode without Developer Mode
 
 Starting with v2.0.0 the plugin can also drive a **cloud-paired printer with
-verification left ON** — no Developer Mode. This keeps the cloud features
-(cloud print dispatch, print history, MakerWorld) but is meant for advanced
-users, because it requires private slicer credentials that this project does
-**not** distribute.
+verification left ON** - no Developer Mode. This keeps the cloud features
+(cloud print dispatch, print history, MakerWorld).
 
 Two things are needed:
 
-**1. Bambu's slicer credentials, which you provide yourself.** Put
-`slicer_cert.pem`, `slicer_key.pem` and `slicer_crl.pem` in the plugin's config
-directory (or point at them with `slicer_cert_pem` / `slicer_key_pem` /
-`slicer_crl_pem` in [`obn.conf`](#configuration-file)). The plugin uses the key
-to sign MQTT `print` commands and to install its app certificate on the printer.
-**These are private credentials. This project does not ship them and gives no
-instructions on obtaining them** — you have to find or extract them yourself,
-and you alone are responsible for ensuring your use complies with the
-applicable terms and law.
+**1. Slicer credentials - automatic.** The plugin provisions them itself the
+same way Bambu's own plugin does: on `bambu_network_update_cert` (Studio
+`check_cert`) and whenever it finds the material missing, expired, or
+cert/key-mismatched, it calls Bambu's certificate endpoint and writes
+`slicer_cert.pem`, `slicer_crl.pem` and `slicer_key.pem` into the plugin's
+config directory ([research 10.2](research/10.02-secrets.md);
+[`src/appcert_fetch.cpp`](src/appcert_fetch.cpp)). Existing files are
+refreshed in place whenever Bambu rotates the certificate, so nothing needs
+renewing by hand. Prefer to supply your own copies instead (e.g. extracted
+from a licensed Bambu Studio install)? Drop them into the config directory or
+point `slicer_cert_pem` / `slicer_key_pem` / `slicer_crl_pem` in
+[`obn.conf`](#configuration-file) at them - they are used as-is and never
+overwritten. The embedded bootstrap values the automatic fetch needs, their
+recovery procedure, and the manual alternative are documented in
+[`src/appcert_cipher.cpp`](src/appcert_cipher.cpp). You alone are responsible
+for ensuring your use complies with the applicable terms and law.
 
 **2. Two settings in [`obn.conf`](#configuration-file).** Set `block_cloud = 0`
 (the default `1` blocks cloud printing outright) and
@@ -327,7 +332,7 @@ Studio does the work.
 | Cloud login / ticket flow            | ✅     | Native              | Browser → `localhost` callback → `POST /user-service/user/ticket/<T>`. Session persisted to `obn.auth.json`.                                                         |
 | User presets sync / profile / avatar | ✅     | Native              | List / create / update / delete works                                                                                                                                |
 | Filament Manager (cloud spool catalogue) | ✅ | Native              | Studio's spool tab (Studio 02.06.01+). All CRUD endpoints plus the bulk AMS sync added in ABI 02.08.01, the AMS slot bind/unbind added in ABI 02.08.02 (new in v2.0.0) and the AMS soft-match queue added in ABI 02.08.03. Needs cloud sign-in; works under the default `block_cloud = 1`. |
-| MQTT command signing                 | 🔒     | Native              | (new in v2.0.0) Signs `print` commands (RSA-PKCS#1 v1.5 + SHA-256) and installs the app cert on the printer **when you supply your own `slicer_key.pem` / `slicer_cert.pem`** — see [Option B](#option-b-cloud-mode-without-developer-mode). Without those keys nothing is signed; use Developer Mode instead. |
+| MQTT command signing                 | ✅     | Native              | (new in v2.0.0) Signs `print` commands (RSA-PKCS#1 v1.5 + SHA-256) and installs the app cert on the printer. The signing material is **auto-provisioned** by `bambu_network_update_cert` (since v0.2.24) - or supply your own `slicer_key.pem` / `slicer_cert.pem` - see [Option B](#option-b-cloud-mode-without-developer-mode). Without signing material nothing is signed (the plugin fetches it, or use Developer Mode instead). |
 
 #### Printing
 
@@ -336,7 +341,7 @@ Studio does the work.
 | LAN print (FTPS + MQTT, Dev Mode)          | ✅ (tested on P2S) | Native      | FTPS upload and `{"print":{"command":"project_file",...}}` command on LAN MQTT.                                                                                                                                             |
 | "Send to Printer" dialog (`ft_*`)          | ✅ (tested on P2S) | Native    | `ft_*` over TLS :6000 — upload `cmd_type=5`, ability `7`, Printer Preview `cmd_type=4` (`mem:/26`). See [STATUS.md §8.14](STATUS.md#814-file-transfer-abi-ft_). |
 | Cloud 3MF upload to S3                     | ✅                 | Native      | 6-step upload sequence reversed from MITM of the stock plugin.                                                                                                                                                              |
-| Cloud print dispatch (`start_print`)       | ⚠️                 | Native      | (new in v2.0.0) Full cloud pipeline: `POST /user/project` → presigned S3 upload → `POST /my/task`. Requires `block_cloud = 0`, `client_name = BambuStudio`, cloud login, and (on a verified printer) your own `slicer_key.pem`. Governed by `cloud_print` (see [Configuration file](#configuration-file)). |
+| Cloud print dispatch (`start_print`)       | ⚠️                 | Native      | (new in v2.0.0) Full cloud pipeline: `POST /user/project` → presigned S3 upload → `POST /my/task`. Requires `block_cloud = 0`, `client_name = BambuStudio`, cloud login, and (on a verified printer) signing material - auto-provisioned by `update_cert` (since v0.2.24) or your own `slicer_key.pem`. Governed by `cloud_print` (see [Configuration file](#configuration-file)). |
 | `create_task` (MakerWorld entry)           | ⚠️                 | Native      | (new in v2.0.0) Writes the MakerWorld task/print-history record as part of the cloud print flow. Needs `client_name = BambuStudio` (otherwise `POST /my/task` → HTTP 403). Not written for pure LAN prints (`try_lan_first` / `lan_only`). |
 | "Print from Device" (`start_sdcard_print`) | ✅ (tested on P2S) | Alternative | Stock plugin: cloud REST endpoint we can't sign. Ours: publish `project_file` on LAN MQTT for a file already on the printer.                                                                                                |
 | AMS telemetry / mapping                    | ✅                 | Passthrough | Studio consumes `push_status` directly.                                                                                                                                                                                     |

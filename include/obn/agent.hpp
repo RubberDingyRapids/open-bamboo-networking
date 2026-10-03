@@ -184,6 +184,17 @@ public:
     bool wait_for_app_cert(const std::string&        dev_id,
                            std::chrono::milliseconds timeout);
 
+    // Studio: GUI_App::check_cert -> bambu_network_update_cert, run on a
+    // background thread right after post_init (research/08.04-lan.md §8.4.6).
+    // Fetches the shared slicer app credentials from Bambu's cert endpoint
+    // and (re)writes slicer_cert.pem / slicer_crl.pem / slicer_key.pem into
+    // the config dir; on success clears the per-session app_cert_install
+    // latches so the refreshed certificate is re-installed to the printer.
+    // Blocking (one HTTPS round trip) — safe off the GUI thread, like Studio.
+    // Returns BAMBU_NETWORK_SUCCESS, or BAMBU_NETWORK_ERR_INVALID_RESULT when
+    // the fetch fails (details are logged).
+    int update_cert();
+
     // Publishes the security.app_cert_install MQTT command (see
     // reverse-networking "Authorization Control/5. MQTT.md"): sends the
     // slicer/app certificate chain + CRL (config_dir/slicer_cert.pem,
@@ -706,6 +717,21 @@ private:
     // live/inflight session already targets it. Non-blocking; safe to call
     // from the SSDP dispatch / HTTP threads that already learned an IP or code.
     void autostart_lan_if_selected(const std::string& dev_id);
+
+    // App-cert fetch coordination for ensure_app_cert_material_(): at most
+    // one worker in flight per Agent, at most one attempt per ~60s backoff.
+    std::mutex                            app_cert_fetch_mu_;
+    bool                                  app_cert_fetch_inflight_ = false;
+    std::chrono::steady_clock::time_point app_cert_fetch_retry_at_{};
+
+    // Kicks update_cert() on a detached thread when the app-cert material is
+    // missing, unusable, or cert/key-mismatched. Non-blocking; safe from the
+    // MQTT report / send paths. Skips while a fetch is in flight or inside
+    // the backoff window (update_cert logs its own failures).
+    void ensure_app_cert_material_();
+    // True while the detached fetch worker is running (send-path bounded
+    // wait exits as soon as no fetch can make progress).
+    bool app_cert_fetch_running();
 
     // --- LAN-priority report subscription (mirrors Studio's conceptual
     // DeviceSubscribeManager local-first behaviour, see issue #49). LAN MQTT

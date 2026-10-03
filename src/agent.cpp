@@ -1,5 +1,6 @@
 #include "obn/agent.hpp"
 
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <thread>
 #include <utility>
 
+#include "obn/appcert.hpp"
 #include "obn/bambu_networking.hpp"
 #include "obn/camera_url.hpp"
 #include "obn/cert_store.hpp"
@@ -1171,6 +1173,14 @@ void Agent::harvest_security_flags(const std::string& dev_id,
         latched = true;
         OBN_INFO("dev=%s advertises new authorization-control system "
                  "(flag3 bit16)", dev_id.c_str());
+        // First sight of a secured printer: make sure we actually hold
+        // signing material for it (issue #2 — unsigned prints to a secured
+        // printer are rejected with 84033543). Fetch runs detached; mu_ is
+        // held but the worker only takes mu_ after fetch_and_store returns.
+        if (!obn::signing::slicer_signing_key_present() ||
+            !obn::signing::slicer_app_cert_usable() ||
+            !obn::appcert::material_consistent())
+            ensure_app_cert_material_();
     }
 }
 
@@ -1488,7 +1498,45 @@ int Agent::send_message_to_printer(const std::string& dev_id,
     // session pointer (the wait may span a reconnect), and never for
     // security/pushing/info frames (would_sign() is false for them), so the
     // install path itself is never gated. See research/08.04-lan.md §8.4.7.
-    const bool sign = obn::signing::would_sign(json_str);
+    bool sign = obn::signing::would_sign(json_str);
+    if (!sign && obn::signing::needs_signing_key(json_str) &&
+        (!obn::signing::slicer_signing_key_present() ||
+         !obn::signing::slicer_app_cert_usable() ||
+         !obn::appcert::material_consistent())) {
+        // Signable command but the app-cert material is missing, unusable, or
+        // cert/key-mismatched: kick the shared-credential fetch (issue #2 —
+        // a secured printer rejects unsigned publishes with 84033543) and
+        // give a RUNNING fetch a bounded window to land. No fetch running
+        // (backoff after a failure) -> no wait, so an offline machine never
+        // stalls its print commands.
+        ensure_app_cert_material_();
+        for (int i = 0; i < 50; ++i) {
+            if (obn::signing::slicer_signing_key_present() &&
+                obn::signing::slicer_app_cert_usable() &&
+                obn::appcert::material_consistent())
+                break;
+            if (!app_cert_fetch_running())
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        sign = obn::signing::would_sign(json_str) &&
+               obn::signing::slicer_app_cert_usable() &&
+               obn::appcert::material_consistent();
+        if (!sign && printer_supports_new_auth(dev_id)) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true))
+                OBN_WARN("send: printer %s requires signed print commands "
+                         "but no usable app cert material is present (fetch "
+                         "failed or still running); the printer will reject "
+                         "with 84033543. Check connectivity to "
+                         "api.bambulab.com, or provision slicer_cert.pem / "
+                         "slicer_crl.pem / slicer_key.pem in %s manually",
+                         dev_id.c_str(),
+                         obn::config::dir().empty()
+                             ? "<config dir>"
+                             : obn::config::dir().c_str());
+        }
+    }
     if (sign)
         wait_for_app_cert(dev_id, std::chrono::seconds(8));
 
@@ -2531,6 +2579,48 @@ bool Agent::ensure_ssdp_discovery_running()
     return d_ptr->start(2021, std::move(on_msg));
 }
 
+int Agent::update_cert()
+{
+    std::string err;
+    const bool ok = obn::appcert::fetch_and_store(&err);
+    {
+        std::lock_guard<std::mutex> lk(app_cert_fetch_mu_);
+        app_cert_fetch_inflight_ = false;
+    }
+    if (!ok) {
+        OBN_WARN("update_cert: app-cert fetch failed: %s "
+                 "(next attempt allowed in ~60s)", err.c_str());
+        return BAMBU_NETWORK_ERR_INVALID_RESULT;
+    }
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        // Refreshed certificate: force a re-install so the printer trusts
+        // the new leaf, not one installed earlier this session.
+        app_cert_install_sent_.clear();
+    }
+    return BAMBU_NETWORK_SUCCESS;
+}
+
+void Agent::ensure_app_cert_material_()
+{
+    {
+        std::lock_guard<std::mutex> lk(app_cert_fetch_mu_);
+        if (app_cert_fetch_inflight_) return;
+        if (std::chrono::steady_clock::now() < app_cert_fetch_retry_at_) return;
+        app_cert_fetch_inflight_ = true;
+        app_cert_fetch_retry_at_ =
+            std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    }
+    OBN_INFO("app-cert material missing/unusable; fetching shared credentials");
+    std::thread([this] { (void)update_cert(); }).detach();
+}
+
+bool Agent::app_cert_fetch_running()
+{
+    std::lock_guard<std::mutex> lk(app_cert_fetch_mu_);
+    return app_cert_fetch_inflight_;
+}
+
 void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
 {
     // Stock: Studio calls this ~1 Hz and after on_printer_connected. Primary
@@ -2572,6 +2662,12 @@ void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
         }
         return;
     }
+
+    // No usable app-cert material: kick the shared-credential fetch so an
+    // install can happen once it lands. Studio's update_cert normally does
+    // this at post_init; Orca never calls it. Guarded — this function runs
+    // on Studio's ~1 Hz refresh tick.
+    ensure_app_cert_material_();
 
     // Fallback: LAN TLS leaf TOFU when no shared app cert material is
     // configured. Never open a second :8883 handshake while LAN MQTT is up.
@@ -3325,7 +3421,45 @@ int Agent::cloud_send_message(const std::string& dev_id,
         return BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
     }
 
-    const bool sign = obn::signing::would_sign(json_str);
+    bool sign = obn::signing::would_sign(json_str);
+    if (!sign && obn::signing::needs_signing_key(json_str) &&
+        (!obn::signing::slicer_signing_key_present() ||
+         !obn::signing::slicer_app_cert_usable() ||
+         !obn::appcert::material_consistent())) {
+        // Signable command but the app-cert material is missing, unusable, or
+        // cert/key-mismatched: kick the shared-credential fetch (issue #2 —
+        // a secured printer rejects unsigned publishes with 84033543) and
+        // give a RUNNING fetch a bounded window to land. No fetch running
+        // (backoff after a failure) -> no wait, so an offline machine never
+        // stalls its print commands.
+        ensure_app_cert_material_();
+        for (int i = 0; i < 50; ++i) {
+            if (obn::signing::slicer_signing_key_present() &&
+                obn::signing::slicer_app_cert_usable() &&
+                obn::appcert::material_consistent())
+                break;
+            if (!app_cert_fetch_running())
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        sign = obn::signing::would_sign(json_str) &&
+               obn::signing::slicer_app_cert_usable() &&
+               obn::appcert::material_consistent();
+        if (!sign && printer_supports_new_auth(dev_id)) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true))
+                OBN_WARN("send: printer %s requires signed print commands "
+                         "but no usable app cert material is present (fetch "
+                         "failed or still running); the printer will reject "
+                         "with 84033543. Check connectivity to "
+                         "api.bambulab.com, or provision slicer_cert.pem / "
+                         "slicer_crl.pem / slicer_key.pem in %s manually",
+                         dev_id.c_str(),
+                         obn::config::dir().empty()
+                             ? "<config dir>"
+                             : obn::config::dir().c_str());
+        }
+    }
     if (sign)
         wait_for_app_cert(dev_id, std::chrono::seconds(8));
 

@@ -56,10 +56,16 @@ OBN_ABI int bambu_network_send_message_to_printer(void* agent,
     return rc;
 }
 
-OBN_ABI int bambu_network_update_cert(void* /*agent*/)
+OBN_ABI int bambu_network_update_cert(void* agent)
 {
+    // Studio: GUI_App::check_cert, invoked on a background thread from
+    // post_init (research/08.04-lan.md §8.4.6). Fetches the shared app
+    // credentials and (re)writes slicer_cert/crl/key into the config dir.
+    // Blocking like the stock implementation; Studio ignores the return.
     OBN_DEBUG("update_cert");
-    return BAMBU_NETWORK_SUCCESS;
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    return a->update_cert();
 }
 
 OBN_ABI void bambu_network_install_device_cert(void* agent,

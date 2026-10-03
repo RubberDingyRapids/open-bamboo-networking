@@ -390,6 +390,8 @@ add_library(bambu_networking SHARED
     src/cloud_print.cpp
     src/cloud_session.cpp
     ${OBN_CLOUD_CA_SOURCES}
+    src/appcert_cipher.cpp
+    src/appcert_fetch.cpp
     src/cover_cache.cpp
     src/cover_key.cpp
     src/cover_server.cpp
@@ -740,6 +742,20 @@ endif()
 # tests (compiled only if BUILD_TESTING is on)
 # --------------------------------------------------------------------------
 
+# Windows-native E2E probe for bambu_network_update_cert (plugin_runner is
+# dlopen-only, i.e. POSIX). Loads the built DLL, runs create_agent ->
+# set_config_dir -> start -> update_cert into a fresh data dir and verifies
+# the credential files landed. Manual tool — hits the live cert endpoint, so
+# it is deliberately NOT a ctest.
+if(WIN32)
+    add_executable(update_cert_probe tools/update_cert_probe/main.cpp)
+    target_include_directories(update_cert_probe PRIVATE include)
+    target_link_libraries(update_cert_probe PRIVATE OpenSSL::Crypto)
+    if(MSVC)
+        target_compile_options(update_cert_probe PRIVATE /utf-8)
+    endif()
+endif()
+
 option(OBN_BUILD_TESTS "Build smoke tests" OFF)
 if(OBN_BUILD_TESTS)
     enable_testing()
@@ -825,6 +841,17 @@ if(OBN_BUILD_TESTS)
         target_link_libraries(signing_test PRIVATE ws2_32)
     endif()
     add_test(NAME signing COMMAND signing_test)
+
+    # obn::appcert: shared app-cert fetch cipher + embedded bootstrap values.
+    # Ports the KATs of tools/fetch_slicer_credentials.py --self-test (custom
+    # S-box AES-256-CTR keystream, blob framing, CRT-limb rebuild with a
+    # sign/verify round-trip). Hermetic — no network, no on-disk secrets:
+    # links only the cipher translation unit.
+    add_executable(appcert_test tests/appcert_test.cpp
+        src/appcert_cipher.cpp)
+    target_include_directories(appcert_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_link_libraries(appcert_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    add_test(NAME appcert COMMAND appcert_test)
 
     # ensure_block_cloud_off() + the obn_ensure_conf_block_cloud() export the
     # plugin installer delegates obn.conf writes to (OrcaSlicer's audit denies

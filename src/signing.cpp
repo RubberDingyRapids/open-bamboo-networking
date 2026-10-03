@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -130,26 +131,41 @@ static std::string leaf_issuer_rfc2253(X509* cert)
     return issuer;
 }
 
-// Parsed once: MQTT cert_id = serial+issuer; HTTP = issuer:serial.
+// MQTT cert_id = serial+issuer; HTTP = issuer:serial. Cached under
+// g_cache_mu; dropped by invalidate_cache() after a credential refresh.
 struct AppCertIds {
     std::string mqtt;
     std::string http;
 };
 
-static const AppCertIds& app_cert_ids()
+// --- Credential caches, guarded by g_cache_mu. --------------------------
+// g_cached_key loads lazily on first use. invalidate_cache() (called by the
+// app-cert fetch after it writes refreshed files) MOVES a replaced key into
+// g_retired_keys instead of freeing it: slicer_pkey() hands out raw
+// pointers and an in-flight signature may still be using the old object
+// while the fetch thread swaps the material.
+static std::mutex                          g_cache_mu;
+static std::unique_ptr<EVP_PKEY, PkeyDel>  g_cached_key;
+static std::vector<std::unique_ptr<EVP_PKEY, PkeyDel>> g_retired_keys;
+static bool                                g_key_loaded = false;
+static std::shared_ptr<const AppCertIds>   g_app_cert_ids;
+
+// Caller must hold g_cache_mu.
+static std::shared_ptr<const AppCertIds> app_cert_ids_locked()
 {
-    static const AppCertIds ids = []() -> AppCertIds {
-        auto cert = load_slicer_leaf_cert();
-        if (!cert) return {};
-        const std::string serial = leaf_serial_hex_lower(cert.get());
-        const std::string issuer = leaf_issuer_rfc2253(cert.get());
-        if (serial.empty() || issuer.empty()) return {};
-        AppCertIds out;
-        out.mqtt = serial + issuer;
-        out.http = issuer + ":" + serial;
-        return out;
-    }();
-    return ids;
+    if (!g_app_cert_ids) {
+        auto ids = std::make_shared<AppCertIds>();
+        if (auto cert = load_slicer_leaf_cert()) {
+            const std::string serial = leaf_serial_hex_lower(cert.get());
+            const std::string issuer = leaf_issuer_rfc2253(cert.get());
+            if (!serial.empty() && !issuer.empty()) {
+                ids->mqtt = serial + issuer;
+                ids->http = issuer + ":" + serial;
+            }
+        }
+        g_app_cert_ids = std::move(ids);
+    }
+    return g_app_cert_ids;
 }
 
 } // namespace
@@ -157,16 +173,18 @@ static const AppCertIds& app_cert_ids()
 // cert_id identifies the slicer's registered signing certificate on Bambu's
 // backend. Derived from the leaf of slicer_cert.pem:
 //   lowercase_hex(serial) + issuer_RFC2253  (no separator).
-const std::string& slicer_cert_id()
+std::string slicer_cert_id()
 {
-    return app_cert_ids().mqtt;
+    std::lock_guard<std::mutex> lk(g_cache_mu);
+    return app_cert_ids_locked()->mqtt;
 }
 
 // HTTP x-bbl-app-certification-id: issuer_RFC2253 + ":" + serial.lower(),
 // from the same leaf parse as slicer_cert_id().
-const std::string& app_certification_id()
+std::string app_certification_id()
 {
-    return app_cert_ids().http;
+    std::lock_guard<std::mutex> lk(g_cache_mu);
+    return app_cert_ids_locked()->http;
 }
 
 namespace {
@@ -187,8 +205,12 @@ static std::unique_ptr<EVP_PKEY, PkeyDel> load_pkey()
 
 EVP_PKEY* slicer_pkey()
 {
-    static const std::unique_ptr<EVP_PKEY, PkeyDel> key = load_pkey();
-    return key.get();
+    std::lock_guard<std::mutex> lk(g_cache_mu);
+    if (!g_key_loaded) {
+        g_cached_key = load_pkey();
+        g_key_loaded = true;
+    }
+    return g_cached_key.get();
 }
 
 
@@ -373,6 +395,21 @@ std::string build_envelope(const std::string& to_sign,
 bool would_sign(const std::string& payload_json)
 {
     return !signable_root_key(payload_json).empty() && slicer_pkey() != nullptr;
+}
+
+bool needs_signing_key(const std::string& payload_json)
+{
+    return !signable_root_key(payload_json).empty();
+}
+
+void invalidate_cache()
+{
+    std::lock_guard<std::mutex> lk(g_cache_mu);
+    if (g_cached_key)
+        g_retired_keys.push_back(std::move(g_cached_key));
+    g_cached_key.reset();
+    g_key_loaded = false;
+    g_app_cert_ids.reset();
 }
 
 bool slicer_signing_key_present()
