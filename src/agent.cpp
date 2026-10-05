@@ -1725,14 +1725,23 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
         OBN_WARN("camera_url(remote): no cloud token for dev=%s", dev_id.c_str());
         return {};
     }
-    // POST /user/ttcode mints the TUTK uid. X-BBL-Client-Name/OS-Type are
-    // harmless here, but the PoP pair is fatal: bisected against production
-    // 2026-09-28, one header group per request - X-BBL only -> 200, X-BBL plus
-    // x-bbl-app-certification-id/x-bbl-device-security-sign -> 403 {"code":8},
-    // PoP alone -> 403, no X-BBL at all -> 200. So research/10.05's "PoP
-    // required" does not hold for this endpoint, and attaching a pair the
-    // server cannot verify costs the mint. Keep the header set that works.
+    // POST /user/ttcode mints the TUTK uid. What the server requires on this
+    // request depends on the printer. On a P1S the mint succeeds without the
+    // proof-of-possession pair (the 2026-09-28 bisect that removed it here was
+    // done on a P1S and holds for that model). On an H2S (01.02.50.00, cloud
+    // bound) the same request is refused with 403 {"code":8} unless both the
+    // PoP pair (x-bbl-app-certification-id / x-bbl-device-security-sign,
+    // research/10.05) and a populated X-BBL-Executable-info (see
+    // bbl_headers()) are present; observed 2026-10-05/06. Sending PoP is
+    // harmless on printers that do not need it, and matches upstream ClusterM.
     auto hdrs = obn::cloud::bbl_headers(session.access_token, session.user_id);
+    if (!obn::signing::add_pop_headers(hdrs)) {
+        OBN_WARN("camera_url(remote): no slicer cert/key for PoP headers; "
+                 "/user/ttcode will most likely answer 403 for dev=%s",
+                 dev_id.c_str());
+    } else {
+        OBN_INFO("camera_url(remote): PoP headers attached to ttcode mint");
+    }
 
     const auto parsed = obn::camera::parse_packed_dev_key(dev_id);
     const std::string& serial = parsed.serial;
