@@ -16,6 +16,7 @@
 #include <openssl/rsa.h>
 #include <openssl/x509.h>
 
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -508,20 +509,24 @@ std::string device_security_sign()
 // A key and cert that do not belong together make x-bbl-device-security-sign
 // unverifiable, and the cloud then refuses the whole request (403 code 8)
 // rather than ignoring the header - worse than sending no PoP on printers
-// that do not require it. Checked once per process.
+// that do not require it.
+// Deliberately not cached: both files can land after process start
+// (ensure_app_cert_material_ fetches them on demand), and a one-shot false
+// would disable PoP for the whole session. Recompute per call - this runs
+// only on ttcode mints, and a mismatch is warned once.
 static bool slicer_key_matches_cert()
 {
-    static const bool matches = []() {
-        EVP_PKEY* pkey = slicer_pkey();
-        auto cert = load_slicer_leaf_cert();
-        if (!pkey || !cert) return false;
-        const bool ok = X509_check_private_key(cert.get(), pkey) == 1;
-        if (!ok)
+    EVP_PKEY* pkey = slicer_pkey();
+    auto cert = load_slicer_leaf_cert();
+    if (!pkey || !cert) return false;
+    const bool ok = X509_check_private_key(cert.get(), pkey) == 1;
+    if (!ok) {
+        static std::atomic<bool> mismatch_warned{false};
+        if (!mismatch_warned.exchange(true))
             OBN_WARN("PoP: slicer_key.pem is not the private key for slicer_cert.pem; "
                      "proof-of-possession headers will not be sent");
-        return ok;
-    }();
-    return matches;
+    }
+    return ok;
 }
 
 bool add_pop_headers(std::map<std::string, std::string>& headers)

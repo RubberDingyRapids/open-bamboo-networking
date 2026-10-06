@@ -109,6 +109,14 @@ struct Settings {
     // stock client identity.
     std::string client_name;
 
+    // Value sent in `X-BBL-Executable-info` on cloud REST calls. Bambu's
+    // cloud validates the JSON contents (hash_value, serial_number, ...) and
+    // answers 403 when they do not match a known Studio build, so empty
+    // falls back to the built-in copy of BambuStudio's EV code-signing
+    // attestation. Override here if Bambu rotates the attestation and the
+    // built-in value stops being accepted.
+    std::string executable_info;
+
     // BambuSource logging — propagated to libBambuSource via obn.env
     std::string bambusource_log_level;
     std::string bambusource_log_stderr;

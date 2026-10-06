@@ -240,6 +240,16 @@ slicer_crl_pem =
 
 client_name = OpenBambooNetworking
 
+# Value sent as X-BBL-Executable-info on cloud API calls. Bambu's cloud
+# checks these contents against the attestation of a known Studio build
+# and answers 403 when they do not match, which breaks cloud live view
+# on H2 printers (they require proof-of-possession on the ttcode mint).
+# Leave empty for the built-in copy of BambuStudio's attestation; fill it
+# in only when Bambu has rotated the attestation and the built-in value
+# stopped being accepted.
+
+executable_info = 
+
 # How a print is sent when the slicer wants to use the cloud / "print
 # with record" path (typical for a printer that is linked to your
 # Bambu account). This does not change pure LAN-only printers.
