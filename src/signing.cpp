@@ -467,8 +467,29 @@ std::string device_security_sign()
         reinterpret_cast<const unsigned char*>(ts.data()), ts.size());
 }
 
+// True when slicer_key.pem is the private key belonging to slicer_cert.pem.
+// A key and cert that do not belong together make x-bbl-device-security-sign
+// unverifiable, and the cloud then refuses the whole request (403 code 8)
+// rather than ignoring the header - worse than sending no PoP on printers
+// that do not require it. Checked once per process.
+static bool slicer_key_matches_cert()
+{
+    static const bool matches = []() {
+        EVP_PKEY* pkey = slicer_pkey();
+        auto cert = load_slicer_leaf_cert();
+        if (!pkey || !cert) return false;
+        const bool ok = X509_check_private_key(cert.get(), pkey) == 1;
+        if (!ok)
+            OBN_WARN("PoP: slicer_key.pem is not the private key for slicer_cert.pem; "
+                     "proof-of-possession headers will not be sent");
+        return ok;
+    }();
+    return matches;
+}
+
 bool add_pop_headers(std::map<std::string, std::string>& headers)
 {
+    if (!slicer_key_matches_cert()) return false;
     const std::string& cert_id  = app_certification_id();
     const std::string  sec_sign = device_security_sign();
     if (cert_id.empty() || sec_sign.empty()) return false;
