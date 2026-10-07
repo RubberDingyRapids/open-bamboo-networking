@@ -92,7 +92,10 @@ std::map<std::string, std::string> bbl_headers(const std::string& access_token,
     h["Authorization"]        = "Bearer " + access_token;
     h["Content-Type"]         = "application/json";
     h["Accept"]               = "application/json";
-    h["X-BBL-Client-Name"]    = cfg_client_name.empty() ? std::string{"OpenBambooNetworking"}
+    // BambuStudio is required, not cosmetic: /my/task and /user/ttcode
+    // reject any other client name with HTTP 403 (research/
+    // 06.06-cloud-rest.md).
+    h["X-BBL-Client-Name"]    = cfg_client_name.empty() ? std::string{"BambuStudio"}
                                                         : cfg_client_name;
     h["X-BBL-Client-Type"]    = "slicer";
     h["X-BBL-OS-Type"]        = os_type();

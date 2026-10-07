@@ -81,7 +81,7 @@ per ABI). Plugin downloads are cached in
                           (status=ConnectStatusOk) before the publish
                           channel is considered ready. Default 800; bump
                           to 15000+ on slow handshakes (see §9).
---client-name NAME        X-BBL-Client-Name. Default OpenBambooNetworking.
+--client-name NAME        X-BBL-Client-Name. Default BambuStudio.
                           POST /my/task answers 403 for anything other
                           than `BambuStudio`, so pass that when you need a
                           faithful stock cloud-print capture.

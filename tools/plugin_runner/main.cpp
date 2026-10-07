@@ -311,10 +311,10 @@ struct CliArgs {
     // printer's public key back. With true on a cloud-paired printer the
     // plugin has nothing to sign with and every print:* publish fails -4030.
     bool        cert_lan_only = true;
-    // X-BBL-Client-Name. Honest by default, but the cloud gates some
-    // endpoints on the value: POST /my/task answers 403 for anything but
-    // "BambuStudio", so faithful stock captures need --client-name.
-    std::string client_name = "OpenBambooNetworking";
+    // X-BBL-Client-Name. The cloud gates some endpoints on this value:
+    // POST /my/task and /user/ttcode answer 403 for anything but
+    // "BambuStudio", so the default matches the runtime plugin.
+    std::string client_name = "BambuStudio";
     int         timeout_s = 90;
     int         connect_settle_ms = 800;
     bool        keep_tmpdir = false;

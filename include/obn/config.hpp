@@ -101,12 +101,11 @@ struct Settings {
 
     // Value sent in the `X-BBL-Client-Name` HTTP header on cloud REST calls.
     // The MakerWorld `POST /my/task` endpoint authorizes access to the
-    // uploaded print content ONLY for the stock client name "BambuStudio";
-    // any other value is rejected with HTTP 403 ("no access rights to the
-    // content"), which blocks cloud printing and "local print with record".
-    // Empty = honest default "OpenBambooNetworking" (cloud /my/task will 403).
-    // Set to "BambuStudio" to make cloud printing work by presenting the
-    // stock client identity.
+    // uploaded print content ONLY for the stock client name "BambuStudio",
+    // and the `/user/ttcode` camera mint has the same requirement; any other
+    // value is rejected with HTTP 403 ("no access rights to the content"),
+    // which blocks cloud printing, "local print with record" and cloud
+    // live view. Empty falls back to "BambuStudio" in bbl_headers().
     std::string client_name;
 
     // Value sent in `X-BBL-Executable-info` on cloud REST calls. Bambu's

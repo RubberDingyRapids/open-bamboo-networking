@@ -726,6 +726,13 @@ int create_task(const std::string& api, const std::string& token,
               "(config client_name=%s) uid=%s",
               hdrs["X-BBL-Client-Name"].c_str(), hdrs["X-BBL-OS-Type"].c_str(),
               obn::config::current().client_name.c_str(), user_id.c_str());
+    // The cloud rejects a non-BambuStudio client name on this endpoint
+    // with 403, so surface the config mistake before the response does.
+    if (hdrs["X-BBL-Client-Name"] != "BambuStudio")
+        OBN_WARN("cloud_print: create_task X-BBL-Client-Name=%s is not "
+                 "BambuStudio; /my/task answers 403 for it (obn.conf "
+                 "client_name, see research/06.06-cloud-rest.md)",
+                 hdrs["X-BBL-Client-Name"].c_str());
     // Signing headers are best-effort: when no slicer key/cert is configured
     // these come back empty, and we omit them rather than send blanks. The
     // cloud verifies x-bbl-device-security-sign by recovering a recent

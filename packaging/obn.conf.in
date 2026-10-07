@@ -233,12 +233,13 @@ slicer_key_pem =
 slicer_crl_pem =
 
 # Name this plugin sends as the client identity on cloud API calls.
-# Starting a cloud print / print history record is only accepted by
-# Bambu when this matches the official slicer name "BambuStudio".
-# The honest default below will be rejected for those print APIs until
-# you change it.
+# POST /v1/user-service/my/task (cloud print / print history record) and
+# the /user/ttcode camera mint only accept the official slicer name
+# "BambuStudio" and answer HTTP 403 for any other value, which breaks
+# both (research/06.06-cloud-rest.md, reproduced 2026-10-07 on the CN
+# cloud with an H2D). The default therefore has to be BambuStudio.
 
-client_name = OpenBambooNetworking
+client_name = BambuStudio
 
 # Value sent as X-BBL-Executable-info on cloud API calls. Bambu's cloud
 # checks these contents against the attestation of a known Studio build
