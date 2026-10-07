@@ -1160,6 +1160,8 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     # whole core has to be linked in.
     set(OBN_TEST_CORE_SOURCES
         src/agent.cpp
+        src/appcert_cipher.cpp
+        src/appcert_fetch.cpp
         src/auth.cpp
         src/camera_url.cpp
         src/cert_store.cpp
@@ -1169,7 +1171,10 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/cloud_print.cpp
         src/cloud_session.cpp
         src/cover_cache.cpp
+        src/cover_key.cpp
         src/cover_server.cpp
+        src/err_table.cpp
+        src/err_table_data.cpp
         src/ftps.cpp
         src/http_client.cpp
         src/json_lite.cpp
