@@ -733,23 +733,22 @@ int create_task(const std::string& api, const std::string& token,
                  "BambuStudio; /my/task answers 403 for it (obn.conf "
                  "client_name, see research/06.06-cloud-rest.md)",
                  hdrs["X-BBL-Client-Name"].c_str());
-    // Signing headers are best-effort: when no slicer key/cert is configured
-    // these come back empty, and we omit them rather than send blanks. The
-    // cloud verifies x-bbl-device-security-sign by recovering a recent
-    // timestamp from the signature (current time in ms, raw PKCS#1 v1.5, not
-    // the body); it is only enforced on signed writes.
-    // The HTTP header uses `issuer:serial.lower()`, a DIFFERENT serialization
-    // from the MQTT envelope cert_id (`serial+issuer`). Sending the MQTT form
-    // here gets the write rejected with 403.
-    const std::string cert_id  = obn::signing::app_certification_id();
-    const std::string sec_sign = obn::signing::device_security_sign();
-    OBN_DEBUG("cloud_print: create_task sign hdrs cert_id='%s' (len=%zu) sec_sign_len=%zu",
-              cert_id.c_str(), cert_id.size(), sec_sign.size());
-    // Signing headers: Bambu Cloud user-service verifies Bearer token + client identity.
-    // Presenting third-party app certs on /my/task causes 403 ("The client does not have access rights to the content").
-    // Omit PoP headers on cloud /my/task dispatch so server authorizes with standard bearer + client identity.
-    (void)cert_id;
-    (void)sec_sign;
+    // Proof-of-possession headers (research/10.05): the cloud requires them
+    // on /my/task for a secured printer and ignores them on an unsecured
+    // one. An H2S and an H2D answered 403 "The client does not have access
+    // rights to the content" without them (2026-10-07) while a P1S printed
+    // fine. They were left off here while the app-cert material was
+    // unreliable; since 0.2.24 the shared Studio cert is provisioned
+    // automatically, and add_pop_headers only attaches the pair when
+    // slicer_key.pem matches slicer_cert.pem, the same guard the
+    // /user/ttcode mint uses. The cloud verifies x-bbl-device-security-sign
+    // by recovering a recent timestamp (ms) from the signature, not the
+    // body. The header cert id is `issuer:serial.lower()`, a DIFFERENT
+    // serialization from the MQTT envelope cert_id; the MQTT form gets the
+    // write rejected with 403.
+    if (!obn::signing::add_pop_headers(hdrs))
+        OBN_WARN("cloud_print: create_task without PoP headers (no usable "
+                 "slicer cert/key); a secured printer will answer 403");
     req.headers   = std::move(hdrs);
     req.body      = body;
     req.timeout_s = 60;
@@ -761,8 +760,9 @@ int create_task(const std::string& api, const std::string& token,
     // the printer to fetch the uploaded content. Swallowing its failure led to
     // silent breakage (the job would proceed with task_id=0 and then stall on
     // the printer with "failed to download"), so surface it instead.
-    // The most common cause of a 403 here is X-BBL-Client-Name != "BambuStudio"
-    // (see config::client_name) or an X-BBL-OS-Type / uploader-OS mismatch.
+    // The usual causes of a 403 here are X-BBL-Client-Name != "BambuStudio"
+    // (see config::client_name), an X-BBL-OS-Type / uploader-OS mismatch, or
+    // a secured printer with no PoP headers (see above).
     // Note: this path is only reached for cloud prints (bambu_network_start_print)
     // and "local print with record" (start_local_print_with_record); block_cloud
     // stops run_cloud_print_job before we ever get here, and pure LAN printing
