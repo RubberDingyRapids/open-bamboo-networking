@@ -1285,6 +1285,8 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     add_executable(lan_bind_tcp_test tests/lan_bind_tcp_test.cpp
         src/lan_bind_tcp.cpp
         src/config.cpp
+        src/err_table.cpp
+        src/err_table_data.cpp
         src/json_lite.cpp
         src/lan_tls.cpp
         src/log.cpp
