@@ -144,6 +144,8 @@ Agent::~Agent()
     if (lan_watchdog_thread_.joinable()) lan_watchdog_thread_.join();
     if (discovery_) discovery_->stop();
     if (cloud_session_) cloud_session_->stop();
+    for (auto& [uid, extra] : extra_clouds_)
+        if (extra.session) extra.session->stop();
 }
 
 void Agent::schedule_deferred_disconnect()
@@ -1768,7 +1770,9 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
         return {};
     }
 
-    const auto session = user_session_snapshot();
+    // Minted by the account that owns the printer (extra_accounts.hpp).
+    const auto session =
+        session_for_device(obn::camera::parse_packed_dev_key(dev_id).serial);
     if (session.access_token.empty()) {
         OBN_WARN("camera_url(remote): no cloud token for dev=%s", dev_id.c_str());
         return {};
@@ -2369,6 +2373,7 @@ void Agent::set_config_dir(std::string dir)
             obn::config::path_in_dir("obn.auth.json"));
         auth_store_->load();
         hydrate_session();
+        for (auto& stale : load_extra_accounts_()) stale->stop();
 
         const std::string state_path =
             obn::config::path_in_dir("obn.state.json");
@@ -3267,17 +3272,29 @@ int Agent::connect_cloud()
         }
     };
 
-    return session->start(on_connected_cb, on_msg_cb, on_sub_fail_cb);
+    {
+        // Extra accounts' sessions share the report and subscribe-failure
+        // handlers (agent_accounts.cpp).
+        std::lock_guard<std::mutex> lk(mu_);
+        cloud_msg_cb_      = on_msg_cb;
+        cloud_sub_fail_cb_ = on_sub_fail_cb;
+    }
+    int rc = session->start(on_connected_cb, on_msg_cb, on_sub_fail_cb);
+    if (rc == BAMBU_NETWORK_SUCCESS) start_extra_sessions_();
+    return rc;
 }
 
 int Agent::disconnect_cloud()
 {
     std::shared_ptr<CloudSession> sess;
+    std::vector<std::shared_ptr<CloudSession>> extras;
     std::set<std::string>         devs;
     std::string                   lan_dev;
     {
         std::lock_guard<std::mutex> lk(mu_);
         sess = std::move(cloud_session_);
+        for (auto& [uid, extra] : extra_clouds_)
+            if (extra.session) extras.push_back(std::move(extra.session));
         devs.swap(cloud_connected_devs_);
         cloud_notified_devs_.clear();
         cloud_kickstarted_devs_.clear();
@@ -3291,6 +3308,7 @@ int Agent::disconnect_cloud()
         }
     }
     if (sess) sess->stop();
+    for (auto& e : extras) e->stop();
     // Release cached RSA pubkeys learned during this cloud session.
     for (const auto& d : devs) cert_store::forget_printer(d);
     return BAMBU_NETWORK_SUCCESS;
@@ -3329,23 +3347,24 @@ int Agent::cloud_refresh()
 
 int Agent::cloud_add_subscribe(const std::vector<std::string>& dev_ids)
 {
-    std::shared_ptr<CloudSession> sess;
-    std::vector<std::string> filtered;
+    // Grouped by the connection that owns each device (agent_accounts.cpp).
+    // Do not skip devices under LAN priority: cloud subscription
+    // is required for Option B cloud print rescue (84033543 interception).
+    std::map<std::shared_ptr<CloudSession>, std::vector<std::string>> by_session;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        sess = cloud_session_;
-        // Do not skip devices under LAN priority: cloud subscription
-        // is required for Option B cloud print rescue (84033543 interception).
-        for (const auto& d : dev_ids) {
-            filtered.push_back(d);
+        for (const auto& d : dev_ids) by_session[cloud_session_for_locked_(d)].push_back(d);
+    }
+    if (dev_ids.empty()) return BAMBU_NETWORK_SUCCESS;
+    int rc = BAMBU_NETWORK_SUCCESS;
+    for (const auto& [sess, devs] : by_session) {
+        if (!sess) {
+            OBN_WARN("cloud_add_subscribe: no active cloud session for %s", devs.front().c_str());
+            rc = BAMBU_NETWORK_ERR_INVALID_HANDLE;
+        } else if (int r = sess->add_subscribe(devs); r != BAMBU_NETWORK_SUCCESS) {
+            rc = r;
         }
     }
-    if (!sess) {
-        OBN_WARN("cloud_add_subscribe: no active cloud session");
-        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
-    }
-    if (filtered.empty()) return BAMBU_NETWORK_SUCCESS;
-    int rc = sess->add_subscribe(filtered);
     // Covers the other ordering: Studio subscribes on an already-connected
     // session (device list refresh, LAN failback, multi-device page). When it
     // subscribes before CONNACK instead, add_subscribe only records the set and
@@ -3356,19 +3375,21 @@ int Agent::cloud_add_subscribe(const std::vector<std::string>& dev_ids)
 
 int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)
 {
-    std::shared_ptr<CloudSession> sess;
+    std::map<std::shared_ptr<CloudSession>, std::vector<std::string>> by_session;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        sess = cloud_session_;
         for (const auto& d : dev_ids) {
+            by_session[cloud_session_for_locked_(d)].push_back(d);
             cloud_connected_devs_.erase(d);
             cloud_notified_devs_.erase(d);
             cloud_kickstarted_devs_.erase(d);
             app_cert_install_sent_.erase(d);
         }
     }
-    if (!sess) return BAMBU_NETWORK_SUCCESS;
-    return sess->del_subscribe(dev_ids);
+    int rc = BAMBU_NETWORK_SUCCESS;
+    for (const auto& [sess, devs] : by_session)
+        if (sess) if (int r = sess->del_subscribe(devs); r != BAMBU_NETWORK_SUCCESS) rc = r;
+    return rc;
 }
 
 // Stock kickstart shape (research/06.02 + research/12.01): constant
@@ -3381,18 +3402,20 @@ void Agent::kickstart_cloud_status()
 {
     if (!obn::config::current().cloud_pushall_on_connect) return;
 
-    std::shared_ptr<CloudSession> sess;
+    std::vector<std::shared_ptr<CloudSession>> sessions;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        sess = cloud_session_;
+        sessions.push_back(cloud_session_);
+        for (const auto& [uid, extra] : extra_clouds_) sessions.push_back(extra.session);
     }
     // Only bootstrap devices whose report subscription is already live: a
     // reply to a topic nobody listens on is lost, which is exactly the trap
     // of publishing straight after add_subscribe (that runs before CONNACK).
-    if (!sess || !sess->is_connected()) return;
-
     // Queried before taking mu_ so the two mutexes are never nested.
-    const std::vector<std::string> active = sess->active_devices();
+    std::vector<std::string> active;
+    for (const auto& sess : sessions)
+        if (sess && sess->is_connected())
+            for (auto& d : sess->active_devices()) active.push_back(std::move(d));
     std::vector<std::string>       pending;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -3422,7 +3445,7 @@ int Agent::cloud_send_message(const std::string& dev_id,
     std::shared_ptr<CloudSession> sess;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        sess = cloud_session_;
+        sess = cloud_session_for_locked_(dev_id);
     }
     if (!sess) {
         OBN_WARN("cloud_send_message: no active cloud session for %s",

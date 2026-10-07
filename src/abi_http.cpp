@@ -1,4 +1,5 @@
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -10,6 +11,7 @@
 #include "obn/cloud_auth.hpp"
 #include "obn/config.hpp"
 #include "obn/device_region.hpp"
+#include "obn/extra_accounts.hpp"
 #include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
@@ -99,20 +101,26 @@ std::string dump_or_null(const obn::json::Value& v)
 //
 // Security note: dev_access_code is the LAN MQTT password (also shown
 // on the printer display). It is returned in plaintext from this endpoint.
+//
+// Returns the device entries without the envelope; the caller wraps them so
+// extra accounts' printers (extra_accounts.hpp) can be appended first. For
+// those, `name_label` goes in front of each dev_name and `skip_ids` drops
+// printers an earlier account already listed.
 std::string remap_bind_payload(
     const std::string& raw_body,
     std::vector<std::string>* out_dev_ids,
-    std::vector<std::pair<std::string, std::string>>* out_access_codes)
+    std::vector<std::pair<std::string, std::string>>* out_access_codes,
+    const std::string& name_label = {},
+    const std::set<std::string>* skip_ids = nullptr)
 {
     std::string perr;
     auto root = obn::json::parse(raw_body, &perr);
     if (!root) {
         OBN_WARN("get_user_print_info: bad JSON from server: %s", perr.c_str());
-        return R"({"devices":[]})";
+        return {};
     }
 
     std::ostringstream out;
-    out << "{\"message\":\"success\",\"devices\":[";
     // Copy the devices array out of the temporary Value to avoid
     // dangling reference (as_array() returns a reference to storage
     // owned by the temporary returned from find()).
@@ -120,17 +128,18 @@ std::string remap_bind_payload(
     const auto& devs = devs_v.as_array();
     bool first = true;
     for (const auto& d : devs) {
+        // Required by Studio's parser.
+        const auto dev_id = d.find("dev_id").as_string();
+        if (skip_ids && skip_ids->count(dev_id)) continue;
         if (!first) out << ',';
         first = false;
         out << '{';
-        // Required by Studio's parser.
-        const auto dev_id = d.find("dev_id").as_string();
         if (out_dev_ids && !dev_id.empty()) out_dev_ids->push_back(dev_id);
         out << "\"dev_id\":"          << obn::json::escape(dev_id) << ',';
         {
             auto dn = d.find("dev_name");
-            out << "\"dev_name\":" << obn::json::escape(
-                !dn.is_null() ? dn.as_string() : d.find("name").as_string()) << ',';
+            out << "\"dev_name\":" << obn::json::escape(obn::accounts::labelled_name(
+                name_label, !dn.is_null() ? dn.as_string() : d.find("name").as_string())) << ',';
         }
         {
             auto on = d.find("dev_online");
@@ -160,7 +169,6 @@ std::string remap_bind_payload(
             out << ",\"dev_structure\":" << obn::json::escape(v.as_string());
         out << '}';
     }
-    out << "]}";
     return out.str();
 }
 
@@ -182,7 +190,9 @@ bool fetch_user_print_info(obn::Agent* a,
                            const std::string& path,
                            obn::http::Response* out_resp,
                            std::string* out_mapped,
-                           std::vector<std::string>* out_dev_ids)
+                           std::vector<std::string>* out_dev_ids,
+                           const std::string& name_label = {},
+                           const std::set<std::string>* skip_ids = nullptr)
 {
     const std::string url = obn::cloud::api_host(a->cloud_region()) + path;
     std::map<std::string, std::string> hdrs{
@@ -194,7 +204,7 @@ bool fetch_user_print_info(obn::Agent* a,
 
     std::vector<std::pair<std::string, std::string>> access_codes;
     std::string mapped = remap_bind_payload(resp.body, out_dev_ids,
-                                            &access_codes);
+                                            &access_codes, name_label, skip_ids);
     if (count_devices(resp.body) == 0) return false;
 
     // Remember the LAN access code per device so camera_url_for() can mint
@@ -251,8 +261,36 @@ OBN_ABI int bambu_network_get_user_print_info(void* agent,
     }
     if (!ok) {
         OBN_WARN("get_user_print_info: both endpoints returned no devices");
-        mapped = R"({"message":"success","devices":[]})";
+        mapped.clear();
     }
+
+    // Extra accounts (extra_accounts.hpp): append their printers and remember
+    // which account owns each, so MQTT, printing and the camera use that
+    // account. A printer already listed keeps its first owner.
+    std::map<std::string, std::string> owners;
+    std::set<std::string> listed(dev_ids.begin(), dev_ids.end());
+    for (const auto& acct : a->extra_accounts()) {
+        const std::string& uid = acct.session.user_id;
+        obn::http::Response xresp;
+        std::string xmapped;
+        std::vector<std::string> xids;
+        if (!fetch_user_print_info(a, acct.session, print_path, &xresp, &xmapped, &xids, acct.label, &listed) &&
+            !fetch_user_print_info(a, acct.session, bind_path, &xresp, &xmapped, &xids, acct.label, &listed)) {
+            OBN_WARN("get_user_print_info: extra account uid=%s: no devices (HTTP %ld %s)",
+                     uid.c_str(), xresp.status_code, xresp.error.c_str());
+            continue;
+        }
+        if (!mapped.empty() && !xmapped.empty()) mapped += ',';
+        mapped += xmapped;
+        for (const auto& id : xids) {
+            owners[id] = uid;
+            listed.insert(id);
+            dev_ids.push_back(id);
+        }
+        OBN_INFO("get_user_print_info: extra account uid=%s added %zu device(s)", uid.c_str(), xids.size());
+    }
+    a->set_extra_device_owners(std::move(owners));
+    mapped = "{\"message\":\"success\",\"devices\":[" + mapped + "]}";
 
     OBN_INFO("get_user_print_info: mapped %zu -> %zu bytes, %zu device(s)",
              resp.body.size(), mapped.size(), dev_ids.size());
@@ -399,7 +437,7 @@ OBN_ABI int bambu_network_get_printer_firmware(void* agent,
         body = a->render_firmware_json(dev_id);
 
         if (!a->has_firmware_data(dev_id)) {
-            auto s = a->user_session_snapshot();
+            auto s = a->session_for_device(dev_id);
             if (!s.access_token.empty() && !s.user_id.empty()) {
                 const std::string url = obn::cloud::api_host(a->cloud_region())
                     + "/v1/iot-service/api/user/device/version?dev_id=" + dev_id;

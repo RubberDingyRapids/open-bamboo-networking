@@ -87,6 +87,23 @@ bool precreate_private_file(const std::string& path)
 
 } // namespace
 
+Session session_from_json(const obn::json::Value& obj)
+{
+    Session s;
+    s.region        = obj.find("region").as_string();
+    if (s.region.empty()) s.region = "GLOBAL";
+    s.account       = obj.find("account").as_string();
+    s.access_token  = obj.find("access_token").as_string();
+    s.refresh_token = obj.find("refresh_token").as_string();
+    s.expires_at    = parse_iso8601(obj.find("expires_at").as_string());
+    s.user_id       = obj.find("user_id").as_string();
+    s.user_name     = obj.find("user_name").as_string();
+    s.nick_name     = obj.find("nick_name").as_string();
+    s.avatar        = obj.find("avatar").as_string();
+    s.firmware_beta_open = obj.find("firmware_beta_open").as_bool();
+    return s;
+}
+
 Store::Store(std::string path) : path_(std::move(path)) {}
 
 void Store::load()
@@ -110,17 +127,7 @@ void Store::load_locked()
         OBN_WARN("auth: failed to parse %s: %s", path_.c_str(), err.c_str());
         return;
     }
-    s_.region        = root->find("region").as_string();
-    if (s_.region.empty()) s_.region = "GLOBAL";
-    s_.account       = root->find("account").as_string();
-    s_.access_token  = root->find("access_token").as_string();
-    s_.refresh_token = root->find("refresh_token").as_string();
-    s_.expires_at    = parse_iso8601(root->find("expires_at").as_string());
-    s_.user_id       = root->find("user_id").as_string();
-    s_.user_name     = root->find("user_name").as_string();
-    s_.nick_name     = root->find("nick_name").as_string();
-    s_.avatar        = root->find("avatar").as_string();
-    s_.firmware_beta_open = root->find("firmware_beta_open").as_bool();
+    s_ = session_from_json(*root);
     OBN_INFO("auth: loaded session for %s (user_id=%s, expires=%s)",
              s_.account.c_str(), s_.user_id.c_str(),
              to_iso8601(s_.expires_at).c_str());

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "obn/auth.hpp"
+#include "obn/extra_accounts.hpp"
 #include "obn/state.hpp"
 #include "obn/bambu_networking.hpp"
 #include "obn/mqtt_client.hpp"
@@ -466,6 +467,25 @@ public:
     // Studio's load_user_preset().
     std::string cloud_user_id() const;
 
+    // ------------------------------------------------------------------
+    // Extra cloud accounts (obn.accounts.json, see extra_accounts.hpp).
+    // ------------------------------------------------------------------
+    // Re-reads the file, restarts the extra sessions and asks the slicer to
+    // fetch its device list again. Returns the number of enabled accounts.
+    int reload_extra_accounts();
+    // Enabled extra accounts (never the primary uid).
+    std::vector<obn::accounts::ExtraAccount> extra_accounts() const;
+    // dev_id -> extra-account uid, set by get_user_print_info after a merge.
+    // Devices not in the map belong to the primary account.
+    void set_extra_device_owners(std::map<std::string, std::string> owners);
+    // Session of the account that owns dev_id, else the primary session.
+    obn::auth::Session session_for_device(const std::string& dev_id) const;
+    // cloud_api_http_headers() with the owner's Bearer.
+    std::map<std::string, std::string>
+        cloud_api_http_headers_for(const std::string& dev_id) const;
+    // {"api":1,"accounts":[{"user_id","started","connected"}...]}.
+    std::string extra_accounts_status_json() const;
+
 private:
     // Scans an incoming MQTT report frame (LAN or cloud) for a
     // security.app_cert_install success response and installs the returned
@@ -584,6 +604,28 @@ private:
     void shutdown_lan_session();
     std::shared_ptr<ssdp::Discovery> discovery_;
     std::shared_ptr<CloudSession>   cloud_session_;
+    // Extra accounts by user_id. `session` is null until the primary
+    // connection is up and for disabled entries; same take-out-then-stop()
+    // rule as cloud_session_.
+    struct ExtraCloud {
+        obn::accounts::ExtraAccount   account;
+        std::shared_ptr<CloudSession> session;
+    };
+    std::map<std::string, ExtraCloud>  extra_clouds_;
+    std::map<std::string, std::string> extra_dev_owner_;   // dev_id -> user_id
+    // connect_cloud's report / subscribe-failure handlers, shared by the
+    // extra sessions.
+    std::function<void(std::string, std::string)> cloud_msg_cb_;
+    std::function<void(std::string)>              cloud_sub_fail_cb_;
+    // Reads obn.accounts.json into extra_clouds_; returns the previous
+    // sessions for the caller to stop() outside mu_.
+    std::vector<std::shared_ptr<CloudSession>> load_extra_accounts_();
+    // Starts a session for every enabled extra account without one.
+    void start_extra_sessions_();
+    // Session a publish/subscribe for dev_id goes through. Caller holds mu_.
+    std::shared_ptr<CloudSession> cloud_session_for_locked_(const std::string& dev_id) const;
+    // Makes the slicer re-run get_user_print_info (see agent_accounts.cpp).
+    void request_device_list_refresh_();
     // Lazy localhost HTTP server that hands cover PNGs to Studio's
     // wxWebRequest. Only spun up when we first mint a synthetic
     // subtask id; destructor joins its accept loop.

@@ -856,7 +856,9 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
 
-    auto session = user_session_snapshot();
+    // Printers of an extra account (extra_accounts.hpp) get the project,
+    // upload and task under that account.
+    auto session = session_for_device(p.dev_id);
     if (session.access_token.empty() || session.user_id.empty()) {
         if (update_fn) update_fn(BBL::PrintingStageERROR,
                                  BAMBU_NETWORK_ERR_INVALID_HANDLE,

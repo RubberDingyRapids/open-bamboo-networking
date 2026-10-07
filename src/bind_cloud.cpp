@@ -231,7 +231,10 @@ int modify_printer_name(Agent* agent, const std::string& dev_id,
 {
     if (!agent || !agent->user_logged_in())
         return BAMBU_NETWORK_ERR_MODIFY_PRINTER_NAME_FAILED;
-    auto hdrs = agent->cloud_api_http_headers();
+    // An extra account's printer (extra_accounts.hpp) is renamed with its
+    // token, and its errors are not the slicer session's errors.
+    auto hdrs = agent->cloud_api_http_headers_for(dev_id);
+    const bool mine = agent->session_for_device(dev_id).user_id == agent->cloud_user_id();
     std::ostringstream body;
     body << '{'
          << "\"dev_id\":" << obn::json::escape(dev_id) << ','
@@ -241,7 +244,7 @@ int modify_printer_name(Agent* agent, const std::string& dev_id,
         api_base(agent) + "/v1/iot-service/api/user/device/info";
     auto resp = http_patch(url, body.str(), hdrs);
     OBN_INFO("modify_printer_name PATCH device/info http=%ld", resp.status_code);
-    fire_http_error(agent, resp.status_code, resp.body);
+    if (mine) fire_http_error(agent, resp.status_code, resp.body);
     if (!resp.error.empty()) return BAMBU_NETWORK_ERR_MODIFY_PRINTER_NAME_FAILED;
     if (http_json_success(resp.body, resp.status_code)) return BAMBU_NETWORK_SUCCESS;
     return BAMBU_NETWORK_ERR_MODIFY_PRINTER_NAME_FAILED;
@@ -250,7 +253,8 @@ int modify_printer_name(Agent* agent, const std::string& dev_id,
 int unbind_device(Agent* agent, const std::string& dev_id)
 {
     if (!agent || !agent->user_logged_in()) return BAMBU_NETWORK_ERR_UNBIND_FAILED;
-    auto hdrs = agent->cloud_api_http_headers();
+    auto hdrs = agent->cloud_api_http_headers_for(dev_id);
+    const bool mine = agent->session_for_device(dev_id).user_id == agent->cloud_user_id();
     // Stock: DELETE /v1/iot-service/api/user/bind body {"dev_id","force":false}
     const std::string url = api_base(agent) + "/v1/iot-service/api/user/bind";
     std::ostringstream body;
@@ -259,7 +263,7 @@ int unbind_device(Agent* agent, const std::string& dev_id)
          << "\"force\":false}";
     auto resp = http_delete_json(url, body.str(), hdrs);
     OBN_INFO("unbind DELETE /user/bind http=%ld", resp.status_code);
-    fire_http_error(agent, resp.status_code, resp.body);
+    if (mine) fire_http_error(agent, resp.status_code, resp.body);
     if (!resp.error.empty()) return BAMBU_NETWORK_ERR_UNBIND_FAILED;
     if (http_json_success(resp.body, resp.status_code)) return BAMBU_NETWORK_SUCCESS;
     return BAMBU_NETWORK_ERR_UNBIND_FAILED;

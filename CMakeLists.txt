@@ -377,6 +377,8 @@ add_library(bambu_networking SHARED
     src/abi_track.cpp
     src/abi_ft.cpp
     src/agent.cpp
+    src/agent_accounts.cpp
+    src/extra_accounts.cpp
     src/auth.cpp
     src/camera_probe.cpp
     src/camera_url.cpp
@@ -1080,8 +1082,19 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_include_directories(auth_persist_test PRIVATE include)
     add_test(NAME auth_persist COMMAND auth_persist_test)
 
+    add_executable(extra_accounts_test tests/extra_accounts_test.cpp
+        src/auth.cpp
+        src/extra_accounts.cpp
+        src/json_lite.cpp
+        src/log.cpp
+        src/os_compat.cpp)
+    target_include_directories(extra_accounts_test PRIVATE include)
+    add_test(NAME extra_accounts COMMAND extra_accounts_test)
+
     add_executable(lan_live_test tests/lan_live_test.cpp
         src/agent.cpp
+        src/agent_accounts.cpp
+        src/extra_accounts.cpp
         src/appcert_cipher.cpp
         src/appcert_fetch.cpp
         src/auth.cpp
@@ -1165,6 +1178,8 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     # whole core has to be linked in.
     set(OBN_TEST_CORE_SOURCES
         src/agent.cpp
+        src/agent_accounts.cpp
+        src/extra_accounts.cpp
         src/appcert_cipher.cpp
         src/appcert_fetch.cpp
         src/auth.cpp

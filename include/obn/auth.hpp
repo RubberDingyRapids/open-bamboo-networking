@@ -18,6 +18,8 @@
 #include <optional>
 #include <string>
 
+namespace obn::json { class Value; }
+
 namespace obn::auth {
 
 struct Session {
@@ -35,6 +37,10 @@ struct Session {
 
     bool logged_in() const { return !access_token.empty() && !user_id.empty(); }
 };
+
+// Reads one session object in the obn.auth.json layout. obn.accounts.json
+// entries use the same keys (see extra_accounts.hpp).
+Session session_from_json(const obn::json::Value& obj);
 
 class Store {
 public:
